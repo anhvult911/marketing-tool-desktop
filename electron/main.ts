@@ -9,6 +9,13 @@ import { chromium } from 'playwright';
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
+// Hardware Acceleration & Chromium GPU Flags for 60-120 FPS buttery-smooth rendering
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
+app.commandLine.appendSwitch('enable-features', 'VaapiVideoDecoder,CanvasOopRasterization,SmoothScrolling');
+
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
@@ -249,12 +256,19 @@ async function createWindow() {
     title: 'MKT Tools Desktop',
     icon: winIcon,
     backgroundColor: '#0F172A',
+    show: false, // Prevents white flash and stutter
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      backgroundThrottling: false, // Maintains fluid 60 FPS even when not focused
+      spellcheck: false, // Disables heavy background spellchecker thread
     },
     autoHideMenuBar: true,
+  });
+
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show();
   });
 
   let appUrl = 'http://localhost:3000';

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import ScrapeDrawer from '@/components/spam/ScrapeDrawer';
 import ImportLeadModal from '@/components/leads/ImportLeadModal';
 import LeadDetailDrawer from '@/components/leads/LeadDetailDrawer';
@@ -110,42 +110,50 @@ export default function LeadsPage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 5000);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, 15000);
     return () => clearInterval(interval);
   }, []);
 
-  // Group leads into Collections / Tập Leads
-  const collectionsMap = new Map<string, LeadCollection>();
-  leads.forEach(l => {
-    const colName = l.source && l.source.trim() ? l.source.trim() : 'Danh_Sach_Thủ_Công';
-    if (!collectionsMap.has(colName)) {
-      collectionsMap.set(colName, {
-        name: colName,
-        total: 0,
-        pending: 0,
-        sent: 0,
-        failed: 0,
-        platforms: [],
-        lastUpdated: l.created_at
-      });
-    }
-    const col = collectionsMap.get(colName)!;
-    col.total += 1;
-    if (l.status === 'pending') col.pending += 1;
-    else if (l.status === 'sent') col.sent += 1;
-    else if (l.status === 'failed') col.failed += 1;
-    if (l.platform && !col.platforms.includes(l.platform)) {
-      col.platforms.push(l.platform);
-    }
-  });
+  // Group leads into Collections / Tập Leads (Memoized to prevent lag during searching/scrolling)
+  const collectionsList = useMemo(() => {
+    const collectionsMap = new Map<string, LeadCollection>();
+    leads.forEach(l => {
+      const colName = l.source && l.source.trim() ? l.source.trim() : 'Danh_Sach_Thủ_Công';
+      if (!collectionsMap.has(colName)) {
+        collectionsMap.set(colName, {
+          name: colName,
+          total: 0,
+          pending: 0,
+          sent: 0,
+          failed: 0,
+          platforms: [],
+          lastUpdated: l.created_at
+        });
+      }
+      const col = collectionsMap.get(colName)!;
+      col.total += 1;
+      if (l.status === 'pending') col.pending += 1;
+      else if (l.status === 'sent') col.sent += 1;
+      else if (l.status === 'failed') col.failed += 1;
+      if (l.platform && !col.platforms.includes(l.platform)) {
+        col.platforms.push(l.platform);
+      }
+    });
+    return Array.from(collectionsMap.values());
+  }, [leads]);
 
-  const collectionsList = Array.from(collectionsMap.values());
-
-  const filteredCollections = collectionsList.filter(col => {
-    const matchesSearch = col.name.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesPlatform = selectedPlatformFilter === 'all' || col.platforms.includes(selectedPlatformFilter);
-    return matchesSearch && matchesPlatform;
-  });
+  const filteredCollections = useMemo(() => {
+    const q = searchQuery.toLowerCase().trim();
+    return collectionsList.filter(col => {
+      const matchesSearch = !q || col.name.toLowerCase().includes(q);
+      const matchesPlatform = selectedPlatformFilter === 'all' || col.platforms.includes(selectedPlatformFilter);
+      return matchesSearch && matchesPlatform;
+    });
+  }, [collectionsList, searchQuery, selectedPlatformFilter]);
 
   const handleDeleteLead = async (id: number) => {
     try {

@@ -357,7 +357,11 @@ export default function SpamPage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 5000);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, 12000);
     return () => clearInterval(interval);
   }, []);
 

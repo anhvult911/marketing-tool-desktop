@@ -266,7 +266,11 @@ export default function ComposerPage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 5000);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, 15000);
     return () => clearInterval(interval);
   }, []);
 

@@ -83,8 +83,12 @@ export default function AccountsPage() {
 
   useEffect(() => {
     fetchData();
-    // Poll account status updates every 5 seconds
-    const interval = setInterval(fetchData, 5000);
+    // Poll account status updates every 12 seconds only when visible
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, 12000);
     return () => clearInterval(interval);
   }, []);
 

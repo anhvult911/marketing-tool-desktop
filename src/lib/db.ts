@@ -33,7 +33,11 @@ if (!databaseUrl) {
 
 export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
-db.pragma('busy_timeout = 10000');
+db.pragma('synchronous = NORMAL');
+db.pragma('busy_timeout = 15000');
+db.pragma('cache_size = -64000'); // 64MB In-Memory Cache
+db.pragma('temp_store = MEMORY');
+db.pragma('mmap_size = 268435456'); // 256MB Memory-Mapped I/O
 
 // Khởi tạo bảng dữ liệu
 export function initDatabaseSchema() {
@@ -198,6 +202,15 @@ export function initDatabaseSchema() {
     -- Tạo Workspace mặc định nếu chưa có
     INSERT OR IGNORE INTO workspaces (id, name, description) 
     VALUES (1, 'Workspace Mặc định', 'Không gian làm việc chính trên máy tính');
+
+    -- High-Performance Indexes for 60+ FPS instantaneous lookups
+    CREATE INDEX IF NOT EXISTS idx_jobs_ws_status ON jobs(workspace_id, status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_campaign ON jobs(campaign_id);
+    CREATE INDEX IF NOT EXISTS idx_spam_leads_source ON spam_leads(source);
+    CREATE INDEX IF NOT EXISTS idx_spam_leads_ws_status ON spam_leads(workspace_id, status);
+    CREATE INDEX IF NOT EXISTS idx_scraped_job_leads_job ON scraped_job_leads(job_id);
+    CREATE INDEX IF NOT EXISTS idx_social_accounts_ws_status ON social_accounts(workspace_id, status);
+    CREATE INDEX IF NOT EXISTS idx_scrape_jobs_ws_status ON scrape_jobs(workspace_id, status);
   `);
 
   // Migrate existing tables if columns are missing

@@ -101,6 +101,16 @@ const PLATFORM_NAMES: Record<string, string> = {
   unknown: 'Hệ thống'
 };
 
+function LiveClock() {
+  const [time, setTime] = useState('');
+  useEffect(() => {
+    setTime(new Date().toLocaleTimeString());
+    const id = setInterval(() => setTime(new Date().toLocaleTimeString()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  return <span>{time}</span>;
+}
+
 export default function Home() {
   const [data, setData] = useState<AnalyticsData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -109,7 +119,6 @@ export default function Home() {
   const [campaignSearch, setCampaignSearch] = useState('');
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all');
   const [selectedStatus, setSelectedStatus] = useState<string>('all');
-  const [serverTime, setServerTime] = useState<string>('');
 
   // Hover states for tooltips
   const [hoveredLinePoint, setHoveredLinePoint] = useState<{
@@ -175,11 +184,6 @@ export default function Home() {
 
   useEffect(() => {
     fetchData();
-    setServerTime(new Date().toLocaleTimeString());
-    const interval = setInterval(() => {
-      setServerTime(new Date().toLocaleTimeString());
-    }, 1000);
-    return () => clearInterval(interval);
   }, []);
 
   if (loading) {
@@ -798,7 +802,7 @@ export default function Home() {
             <div className="stat-value text-glow-green" style={{ fontSize: '1.25rem', lineHeight: '1.2' }}>RUNNING</div>
           </div>
           <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-            SQLite WAL | {serverTime}
+            SQLite WAL | <LiveClock />
           </div>
         </div>
       </div>
