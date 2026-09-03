@@ -25,6 +25,25 @@ export function getInitials(name: string | null | undefined): string {
   }
 }
 
+const DEFAULT_USER: UserSession = {
+  userId: 1,
+  email: 'admin@desktop.local',
+  fullName: 'Desktop Admin',
+  isSuperAdmin: true,
+  activeWorkspaceId: 1,
+  role: 'admin',
+};
+
+const DEFAULT_WORKSPACES: Workspace[] = [
+  {
+    id: 1,
+    name: 'Workspace Mặc định',
+    subscription_plan: 'Desktop Local',
+    owner_name: 'Local Admin',
+    role: 'admin',
+  }
+];
+
 export default function ResponsiveLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -33,9 +52,9 @@ export default function ResponsiveLayout({ children }: { children: React.ReactNo
   const [isCollapsed, setIsCollapsed] = useState(false);
   
   // User auth states
-  const [user, setUser] = useState<UserSession | null>(null);
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState<UserSession | null>(DEFAULT_USER);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>(DEFAULT_WORKSPACES);
+  const [loading, setLoading] = useState(false);
   const [showWorkspaceDropdown, setShowWorkspaceDropdown] = useState(false);
   const [showUserDropdown, setShowUserDropdown] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
@@ -130,45 +149,26 @@ export default function ResponsiveLayout({ children }: { children: React.ReactNo
   }, []);
 
   useEffect(() => {
-    if (isAuthPage) {
-      setUser(null);
-      setLoading(false);
-      return;
-    }
+    if (isAuthPage) return;
 
-    if (user) {
-      setLoading(false);
-      return;
-    }
-
-    // Fetch current user details
-    const fetchUserData = async () => {
-      setLoading(true);
-      try {
-        const userRes = await fetch('/api/auth/me');
-        if (userRes.ok) {
-          const userData = await userRes.json();
-          setUser(userData.user);
-
-          // If user exists, fetch workspaces
-          const workspacesRes = await fetch('/api/auth/workspaces');
-          if (workspacesRes.ok) {
-            const workspacesData = await workspacesRes.json();
-            setWorkspaces(workspacesData.workspaces || []);
-          }
-        } else if (userRes.status === 401) {
-          // If 401 Unauthorized, redirect to login
-          router.push('/login');
+    fetch('/api/auth/me')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && data.user) {
+          setUser(data.user);
         }
-      } catch (err) {
-        console.error('Error fetching user auth data:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
+      })
+      .catch((err) => console.warn('[Auth] Background sync user:', err));
 
-    fetchUserData();
-  }, [router, pathname, isAuthPage, user]);
+    fetch('/api/auth/workspaces')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && data.workspaces) {
+          setWorkspaces(data.workspaces);
+        }
+      })
+      .catch((err) => console.warn('[Auth] Background sync workspaces:', err));
+  }, [isAuthPage]);
 
   const handleLogout = async () => {
     try {

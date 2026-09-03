@@ -285,6 +285,14 @@ async function createWindow() {
     }
   });
 
+  // Enable F12 to toggle DevTools anytime for inspection
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'F12' && input.type === 'keyDown') {
+      mainWindow?.webContents.toggleDevTools();
+      event.preventDefault();
+    }
+  });
+
   // External link handler
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
