@@ -19,7 +19,7 @@ function isVersionLower(current: string, target: string): boolean {
 
 export function setupAutoUpdater(mainWindow: BrowserWindow) {
   // Only check updates in production builds
-  if (process.env.NODE_ENV === 'development') {
+  if (!app.isPackaged || process.env.NODE_ENV === 'development') {
     return;
   }
 

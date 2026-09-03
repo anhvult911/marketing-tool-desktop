@@ -3,10 +3,11 @@ import path from 'path';
 import fs from 'fs';
 import http from 'http';
 import net from 'net';
-import isDev from 'electron-is-dev';
 import { initAppDirectories, PROFILES_DIR } from './paths';
 import { setupAutoUpdater } from './updater';
 import { chromium } from 'playwright';
+
+const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
