@@ -1,0 +1,43 @@
+import fs from 'fs';
+import path from 'path';
+
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ filename: string }> | { filename: string } }
+) {
+  try {
+    // Resolve params safely (handles both Next.js 14 sync and Next.js 15/16 async params)
+    const resolvedParams = await params;
+    const filename = resolvedParams.filename;
+    
+    const filePath = path.resolve(process.cwd(), 'public', 'uploads', filename);
+
+    if (!fs.existsSync(filePath)) {
+      return new Response('Không tìm thấy tệp tin.', { status: 404 });
+    }
+
+    const fileBuffer = fs.readFileSync(filePath);
+    
+    // Determine the correct Content-Type based on file extension
+    let contentType = 'application/octet-stream';
+    const ext = path.extname(filename).toLowerCase();
+    
+    if (ext === '.png') contentType = 'image/png';
+    else if (ext === '.jpg' || ext === '.jpeg') contentType = 'image/jpeg';
+    else if (ext === '.gif') contentType = 'image/gif';
+    else if (ext === '.webp') contentType = 'image/webp';
+    else if (ext === '.jfif') contentType = 'image/jpeg';
+    else if (ext === '.mp4') contentType = 'video/mp4';
+    else if (ext === '.webm') contentType = 'video/webm';
+    else if (ext === '.mov') contentType = 'video/quicktime';
+
+    return new Response(new Uint8Array(fileBuffer), {
+      headers: {
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=31536000, immutable',
+      },
+    });
+  } catch (err: any) {
+    return new Response('Lỗi đọc tệp tin: ' + err.message, { status: 500 });
+  }
+}

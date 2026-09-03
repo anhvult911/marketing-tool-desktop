@@ -1,0 +1,42 @@
+{
+  "appId": "com.mkttools.desktop",
+  "productName": "MKT Tools Desktop",
+  "copyright": "Copyright © 2026 MKT Tools",
+  "directories": {
+    "output": "dist",
+    "buildResources": "build"
+  },
+  "files": [
+    "dist-electron/**/*",
+    "dist-worker/**/*",
+    ".next/standalone/**/*",
+    "public/**/*",
+    "package.json"
+  ],
+  "asarUnpack": [
+    ".next/standalone/**/*",
+    "dist-worker/**/*"
+  ],
+  "publish": {
+    "provider": "github",
+    "owner": "anhvult911",
+    "repo": "marketing-tool-desktop"
+  },
+  "win": {
+    "icon": "build/icon.ico",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64"]
+      }
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "MKT Tools",
+    "deleteAppDataOnUninstall": false
+  }
+}

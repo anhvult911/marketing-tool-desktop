@@ -1,0 +1,46 @@
+{
+  "name": "marketing-tool-desktop",
+  "version": "1.0.0",
+  "description": "MKT Tools - Hệ thống Tự động hóa Marketing Đa kênh Desktop Edition",
+  "main": "dist-electron/main.js",
+  "author": "MKT Team",
+  "private": true,
+  "scripts": {
+    "dev:next": "next dev",
+    "dev:electron": "wait-on http://localhost:3000 && electron .",
+    "dev": "concurrently -n \"Next,Electron\" -c \"blue,yellow\" \"next dev\" \"tsx electron/dev-runner.ts\"",
+    "build:electron": "npx tsc -p tsconfig.electron.json",
+    "build:worker": "npx tsc worker/worker.ts --outDir dist-worker --skipLibCheck --esModuleInterop --target ES2022 --module CommonJS",
+    "build:next": "next build && node electron/copy-assets.js",
+    "build": "npm run build:electron && npm run build:worker && npm run build:next",
+    "dist": "npm run build && electron-builder",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "better-sqlite3": "^12.11.1",
+    "electron-is-dev": "^3.0.1",
+    "electron-updater": "^6.3.9",
+    "lucide-react": "^1.16.0",
+    "next": "16.2.9",
+    "playwright": "^1.61.0",
+    "postgres": "^3.4.9",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "concurrently": "^10.0.3",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.9",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3",
+    "wait-on": "^8.0.3"
+  }
+}
