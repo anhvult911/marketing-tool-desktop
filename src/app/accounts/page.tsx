@@ -50,33 +50,12 @@ export default function AccountsPage() {
   const [syncLoading, setSyncLoading] = useState(false);
   const profileFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Universal VPS Login Modal state
-  const [vpsLoginAccountId, setVpsLoginAccountId] = useState<number | null>(null);
-  const [vpsLoginPhone, setVpsLoginPhone] = useState('');
-  const [vpsLoginOtp, setVpsLoginOtp] = useState('');
-  const [vpsLoginPassword, setVpsLoginPassword] = useState('');
-  const [vpsLoginStep, setVpsLoginStep] = useState<'phone' | 'otp' | '2fa' | 'qr' | 'loading'>('phone');
-  const [vpsLoginLoading, setVpsLoginLoading] = useState(false);
-  const [vpsLoginError, setVpsLoginError] = useState<string | null>(null);
-  const [vpsLoginSuccessMsg, setVpsLoginSuccessMsg] = useState<string | null>(null);
-  const [screenshotTime, setScreenshotTime] = useState(Date.now());
-
   // Cookie Import Modal States
   const [cookieModalAccountId, setCookieModalAccountId] = useState<number | null>(null);
   const [cookieModalValue, setCookieModalValue] = useState('');
   const [cookieModalLoading, setCookieModalLoading] = useState(false);
   const [cookieModalError, setCookieModalError] = useState<string | null>(null);
   const [cookieModalSuccess, setCookieModalSuccess] = useState<string | null>(null);
-
-  useEffect(() => {
-    let interval: any;
-    if (vpsLoginAccountId !== null && vpsLoginStep !== 'phone') {
-      interval = setInterval(() => {
-        setScreenshotTime(Date.now());
-      }, 3000);
-    }
-    return () => clearInterval(interval);
-  }, [vpsLoginAccountId, vpsLoginStep]);
 
   // Fetch data
   const fetchData = async () => {
@@ -314,160 +293,7 @@ export default function AccountsPage() {
   };
 
   const handleUniversalVpsLoginStart = async (accountId: number) => {
-    setVpsLoginAccountId(accountId);
-    const acc = accounts.find(a => a.id === accountId);
-    if (!acc) return;
-    
-    setVpsLoginError(null);
-    setVpsLoginSuccessMsg(null);
-    
-    if (acc.platform === 'telegram') {
-      setVpsLoginStep('phone');
-      setVpsLoginPhone(acc.username.startsWith('+') ? acc.username : '');
-      return;
-    }
-    
-    setVpsLoginStep('loading');
-    setVpsLoginLoading(true);
-    try {
-      const res = await fetch('/api/accounts/vps-login/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accountId }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        if (data.loggedIn) {
-          setVpsLoginSuccessMsg(data.message || 'Đăng nhập thành công!');
-          handleCheckLive(accountId);
-          setTimeout(() => {
-            handleCloseVpsModalDirectly(accountId);
-          }, 2000);
-        } else if (data.needsQr) {
-          setVpsLoginStep('qr');
-          setVpsLoginSuccessMsg(data.message);
-        } else if (data.needsCode) {
-          setVpsLoginStep('otp');
-          setVpsLoginSuccessMsg(data.message);
-        }
-      } else {
-        setVpsLoginError(data.error);
-      }
-    } catch (err: any) {
-      setVpsLoginError(err.message || 'Lỗi hệ thống.');
-    } finally {
-      setVpsLoginLoading(false);
-    }
-  };
-
-  const handleTelegramVpsStartSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!vpsLoginPhone.trim()) return;
-    setVpsLoginLoading(true);
-    setVpsLoginError(null);
-    setVpsLoginSuccessMsg(null);
-    try {
-      const res = await fetch('/api/accounts/vps-login/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accountId: vpsLoginAccountId, phoneNumber: vpsLoginPhone.trim() }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        if (data.loggedIn) {
-          setVpsLoginSuccessMsg(data.message || 'Đăng nhập thành công!');
-          if (vpsLoginAccountId) handleCheckLive(vpsLoginAccountId);
-          setTimeout(() => {
-            if (vpsLoginAccountId) handleCloseVpsModalDirectly(vpsLoginAccountId);
-          }, 2000);
-        } else if (data.needsOtp) {
-          setVpsLoginStep('otp');
-          setVpsLoginSuccessMsg(data.message);
-        }
-      } else {
-        setVpsLoginError(data.error);
-      }
-    } catch (err: any) {
-      setVpsLoginError(err.message || 'Lỗi hệ thống.');
-    } finally {
-      setVpsLoginLoading(false);
-    }
-  };
-
-  const handleUniversalVpsSubmit = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    setVpsLoginLoading(true);
-    setVpsLoginError(null);
-    setVpsLoginSuccessMsg(null);
-    
-    const acc = accounts.find(a => a.id === vpsLoginAccountId);
-    const isQrPlatform = acc ? (acc.platform === 'zalo' || acc.platform === 'whatsapp') : false;
-    const val = isQrPlatform ? '' : (vpsLoginStep === '2fa' ? vpsLoginPassword : vpsLoginOtp);
-    
-    try {
-      const res = await fetch('/api/accounts/vps-login/submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          accountId: vpsLoginAccountId, 
-          value: val.trim() 
-        }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        if (data.require2fa) {
-          setVpsLoginStep('2fa');
-          setVpsLoginSuccessMsg(data.message || 'Tài khoản yêu cầu mật khẩu xác thực 2 lớp (2FA).');
-        } else {
-          setVpsLoginSuccessMsg(data.message || 'Đăng nhập thành công!');
-          if (vpsLoginAccountId) handleCheckLive(vpsLoginAccountId);
-          setTimeout(() => {
-            handleCloseVpsModal();
-          }, 2000);
-        }
-      } else {
-        setVpsLoginError(data.error);
-        if (data.require2fa) {
-          setVpsLoginStep('2fa');
-        }
-      }
-    } catch (err: any) {
-      setVpsLoginError(err.message || 'Lỗi hệ thống.');
-    } finally {
-      setVpsLoginLoading(false);
-    }
-  };
-
-  const handleCloseVpsModalDirectly = (accountId: number) => {
-    fetch('/api/accounts/vps-login/cancel', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ accountId })
-    }).catch(err => console.error('Error cancelling login session:', err));
-
-    setVpsLoginAccountId(null);
-    setVpsLoginPhone('');
-    setVpsLoginOtp('');
-    setVpsLoginPassword('');
-    setVpsLoginStep('phone');
-    setVpsLoginLoading(false);
-    setVpsLoginError(null);
-    setVpsLoginSuccessMsg(null);
-  };
-
-  const handleCloseVpsModal = () => {
-    if (vpsLoginAccountId !== null) {
-      handleCloseVpsModalDirectly(vpsLoginAccountId);
-    } else {
-      setVpsLoginAccountId(null);
-      setVpsLoginPhone('');
-      setVpsLoginOtp('');
-      setVpsLoginPassword('');
-      setVpsLoginStep('phone');
-      setVpsLoginLoading(false);
-      setVpsLoginError(null);
-      setVpsLoginSuccessMsg(null);
-    }
+    return handleOpenBrowser(accountId);
   };
 
   const handleOpenCookieModal = (acc: Account) => {
@@ -692,9 +518,6 @@ export default function AccountsPage() {
     if (activeTab === 'other') return !['x', 'telegram', 'zalo', 'whatsapp', 'threads', 'newf319', 'facebook', 'instagram', 'tiktok', 'youtube'].includes(acc.platform);
     return acc.platform === activeTab;
   });
-
-  const activeLoginAccount = accounts.find(a => a.id === vpsLoginAccountId);
-  const isX = activeLoginAccount ? activeLoginAccount.platform === 'x' : false;
 
   return (
     <div>
@@ -1093,11 +916,12 @@ export default function AccountsPage() {
                       <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.25rem', flexWrap: 'wrap' }}>
                         <button
                           className="btn btn-secondary"
-                          onClick={() => handleUniversalVpsLoginStart(acc.id)}
+                          onClick={() => handleOpenBrowser(acc.id)}
+                          title="Mở trình duyệt thật để đăng nhập, quét mã hoặc giải Captcha"
                           style={{ flex: 1, minWidth: '70px', padding: '0.35rem 0', fontSize: '0.75rem', borderColor: 'var(--color-primary)', color: 'var(--color-primary)', backgroundColor: 'transparent' }}
                           disabled={loading}
                         >
-                          🔑 Đăng nhập
+                          🌐 Mở Browser
                         </button>
                         <button
                           className="btn btn-secondary"
@@ -1225,8 +1049,8 @@ export default function AccountsPage() {
                             <div style={{ display: 'flex', gap: '0.35rem', justifyContent: 'flex-end', alignItems: 'center', marginTop: '2px' }}>
                               <button
                                 className="btn btn-secondary"
-                                onClick={() => handleUniversalVpsLoginStart(acc.id)}
-                                title="Đăng nhập tài khoản trực tiếp trên VPS"
+                                onClick={() => handleOpenBrowser(acc.id)}
+                                title="Mở trình duyệt thật để đăng nhập, quét mã QR hoặc giải Captcha"
                                 style={{ 
                                   padding: '0.25rem 0.4rem', 
                                   fontSize: '0.8rem', 
@@ -1236,7 +1060,7 @@ export default function AccountsPage() {
                                 }}
                                 disabled={loading}
                               >
-                                🔑 Đăng nhập
+                                🌐 Mở Browser
                               </button>
                               <button
                                 className="btn btn-secondary"
@@ -1411,273 +1235,6 @@ export default function AccountsPage() {
           )}
         </div>
       </div>
-
-      {/* Telegram VPS Login Modal */}
-      {vpsLoginAccountId !== null && (
-        <div className="ux-modal-overlay">
-          <div className="ux-modal-content" style={{ maxWidth: '480px' }}>
-            {(() => {
-              const activeLoginAccount = accounts.find(a => a.id === vpsLoginAccountId);
-              const platformLabel = activeLoginAccount ? activeLoginAccount.platform.toUpperCase() : '';
-              
-              return (
-                <>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
-                    <h3 style={{ margin: 0, fontSize: '1.2rem', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                      <span>📱 Đăng nhập {platformLabel} qua VPS</span>
-                    </h3>
-                    <button 
-                      onClick={handleCloseVpsModal}
-                      style={{
-                        background: 'none',
-                        border: 'none',
-                        color: 'var(--text-secondary)',
-                        fontSize: '1.25rem',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      &times;
-                    </button>
-                  </div>
-
-                  {vpsLoginError && (
-                    <div style={{
-                      backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                      border: '1px solid var(--color-danger)',
-                      color: 'var(--color-danger)',
-                      padding: '0.75rem',
-                      borderRadius: '6px',
-                      fontSize: '0.85rem',
-                      marginBottom: '1rem',
-                      whiteSpace: 'pre-line'
-                    }}>
-                      <div>⚠️ Lỗi: {vpsLoginError}</div>
-                    </div>
-                  )}
-
-                  {vpsLoginSuccessMsg && (
-                    <div style={{
-                      backgroundColor: 'rgba(16, 185, 129, 0.1)',
-                      border: '1px solid var(--color-success)',
-                      color: 'var(--color-success)',
-                      padding: '0.75rem',
-                      borderRadius: '6px',
-                      fontSize: '0.85rem',
-                      marginBottom: '1rem'
-                    }}>
-                      ✅ {vpsLoginSuccessMsg}
-                    </div>
-                  )}
-
-                  {/* Modal Body based on steps */}
-                  {vpsLoginStep === 'loading' && (
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', margin: '2rem 0', gap: '1rem' }}>
-                      {!vpsLoginError ? (
-                        <>
-                          <div className="spinner" style={{ width: '40px', height: '40px', border: '4px solid var(--border-color)', borderTopColor: 'var(--color-primary)', borderRadius: '50%', animation: 'spin 1s linear infinite' }}></div>
-                          <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', textAlign: 'center' }}>
-                            Đang kết nối tới {platformLabel} và thực hiện đăng nhập ngầm trên VPS...
-                          </span>
-                        </>
-                      ) : (
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1.25rem', width: '100%' }}>
-                          <span style={{ fontSize: '0.9rem', color: 'var(--color-danger)', textAlign: 'center', fontWeight: 'bold' }}>
-                            Đăng nhập thất bại hoặc có lỗi xảy ra.
-                          </span>
-                          <button 
-                            type="button" 
-                            className="btn btn-primary"
-                            onClick={() => handleUniversalVpsLoginStart(vpsLoginAccountId!)}
-                            style={{ padding: '0.4rem 1.25rem', fontSize: '0.85rem' }}
-                          >
-                            🔄 Thử lại
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {vpsLoginStep === 'phone' && (
-                    <form onSubmit={handleTelegramVpsStartSubmit}>
-                      <div style={{ marginBottom: '1.25rem' }}>
-                        <label style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
-                          Số điện thoại đăng nhập (Bao gồm mã quốc gia, VD: +84387654321):
-                        </label>
-                        <input
-                          type="text"
-                          className="input"
-                          value={vpsLoginPhone}
-                          onChange={(e) => setVpsLoginPhone(e.target.value)}
-                          placeholder="+84..."
-                          required
-                          style={{ width: '100%', padding: '0.5rem 0.75rem', fontSize: '0.9rem' }}
-                          disabled={vpsLoginLoading}
-                        />
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                        <button 
-                          type="button" 
-                          className="btn btn-secondary" 
-                          onClick={handleCloseVpsModal}
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1rem', fontSize: '0.85rem' }}
-                        >
-                          Hủy
-                        </button>
-                        <button 
-                          type="submit" 
-                          className="btn btn-primary"
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1.25rem', fontSize: '0.85rem' }}
-                        >
-                          {vpsLoginLoading ? 'Đang khởi động...' : 'Gửi mã OTP'}
-                        </button>
-                      </div>
-                    </form>
-                  )}
-
-                  {vpsLoginStep === 'otp' && (
-                    <form onSubmit={handleUniversalVpsSubmit}>
-                      <div style={{ marginBottom: '1.25rem' }}>
-                        <label style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
-                          Nhập mã xác thực (OTP / Confirmation Code):
-                        </label>
-                        <input
-                          type="text"
-                          className="input"
-                          value={vpsLoginOtp}
-                          onChange={(e) => setVpsLoginOtp(e.target.value)}
-                          placeholder={accounts.find(a => a.id === vpsLoginAccountId)?.platform === 'facebook' ? "Mã OTP (hoặc để trống nếu đã duyệt trên thiết bị khác)..." : "Nhập mã xác nhận..."}
-                          style={{ width: '100%', padding: '0.5rem 0.75rem', fontSize: '1rem', textAlign: 'center' }}
-                          disabled={vpsLoginLoading}
-                        />
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                        <button 
-                          type="button" 
-                          className="btn btn-secondary" 
-                          onClick={handleCloseVpsModal}
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1rem', fontSize: '0.85rem' }}
-                        >
-                          Hủy
-                        </button>
-                        <button 
-                          type="submit" 
-                          className="btn btn-primary"
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1.25rem', fontSize: '0.85rem' }}
-                        >
-                          {vpsLoginLoading ? 'Đang gửi...' : 'Xác nhận'}
-                        </button>
-                      </div>
-                    </form>
-                  )}
-
-                  {vpsLoginStep === '2fa' && (
-                    <form onSubmit={handleUniversalVpsSubmit}>
-                      <div style={{ marginBottom: '1.25rem' }}>
-                        <label style={{ display: 'block', fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
-                          Mật khẩu bảo mật 2 lớp (2FA Password):
-                        </label>
-                        <input
-                          type="password"
-                          className="input"
-                          value={vpsLoginPassword}
-                          onChange={(e) => setVpsLoginPassword(e.target.value)}
-                          placeholder="Nhập mật khẩu 2FA..."
-                          required
-                          style={{ width: '100%', padding: '0.5rem 0.75rem', fontSize: '0.9rem' }}
-                          disabled={vpsLoginLoading}
-                        />
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                        <button 
-                          type="button" 
-                          className="btn btn-secondary" 
-                          onClick={handleCloseVpsModal}
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1rem', fontSize: '0.85rem' }}
-                        >
-                          Hủy
-                        </button>
-                        <button 
-                          type="submit" 
-                          className="btn btn-primary"
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1.25rem', fontSize: '0.85rem' }}
-                        >
-                          {vpsLoginLoading ? 'Đang kiểm tra...' : 'Xác nhận 2FA'}
-                        </button>
-                      </div>
-                    </form>
-                  )}
-
-                  {vpsLoginStep === 'qr' && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem' }}>
-                        <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', textAlign: 'center', fontWeight: 'bold' }}>
-                          Vui lòng quét mã QR dưới đây bằng điện thoại của bạn:
-                        </span>
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'center' }}>
-                        <img 
-                          src={`/api/accounts/vps-login/screenshot?accountId=${vpsLoginAccountId}&t=${screenshotTime}`} 
-                          alt="Zalo QR Scan" 
-                          style={{ width: '100%', maxWidth: '320px', borderRadius: '8px', border: '1px solid var(--border-color)', boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }} 
-                        />
-                      </div>
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                        <button 
-                          type="button" 
-                          className="btn btn-secondary" 
-                          onClick={handleCloseVpsModal}
-                          style={{ padding: '0.4rem 1rem', fontSize: '0.85rem' }}
-                        >
-                          Hủy
-                        </button>
-                        <button 
-                          type="button" 
-                          className="btn btn-primary"
-                          onClick={() => handleUniversalVpsSubmit()}
-                          disabled={vpsLoginLoading}
-                          style={{ padding: '0.4rem 1.25rem', fontSize: '0.85rem' }}
-                        >
-                          {vpsLoginLoading ? 'Đang kiểm tra...' : '🔄 Xác nhận đã quét'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Universal Live Screen viewer for non-phone steps */}
-                  {vpsLoginStep !== 'phone' && vpsLoginStep !== 'qr' && (
-                    <div style={{ marginTop: '1.25rem', borderTop: '1px solid var(--border-color)', paddingTop: '1rem' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                        <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-                          📷 VPS Live Screen (Tự động tải lại sau 3 giây):
-                        </span>
-                        <a 
-                          href={`/api/accounts/vps-login/screenshot?accountId=${vpsLoginAccountId}&t=${screenshotTime}`} 
-                          target="_blank" 
-                          rel="noopener noreferrer"
-                          style={{ fontSize: '0.75rem', color: '#60a5fa', textDecoration: 'underline' }}
-                        >
-                          Mở ảnh lớn
-                        </a>
-                      </div>
-                      <img 
-                        src={`/api/accounts/vps-login/screenshot?accountId=${vpsLoginAccountId}&t=${screenshotTime}`} 
-                        alt="VPS Live Screen" 
-                        style={{ width: '100%', borderRadius: '6px', border: '1px solid var(--border-color)', display: 'block' }} 
-                      />
-                    </div>
-                  )}
-                </>
-              );
-            })()}
-          </div>
-        </div>
-      )}
 
       {/* Cookie Import Modal */}
       {cookieModalAccountId !== null && (

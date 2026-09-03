@@ -52,6 +52,46 @@ export default function ResponsiveLayout({ children }: { children: React.ReactNo
   // Workspace settings state
   const [workspaceApiKey, setWorkspaceApiKey] = useState('');
   const [loadingApiKey, setLoadingApiKey] = useState(false);
+  const [restoringBackup, setRestoringBackup] = useState(false);
+
+  const handleRestoreBackup = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!confirm('Hành động này sẽ ghi đè CSDL và các phiên đăng nhập hiện tại bằng bản sao lưu. Bạn có chắc chắn muốn tiếp tục?')) {
+      e.target.value = '';
+      return;
+    }
+
+    setRestoringBackup(true);
+    setProfileError('');
+    setProfileSuccess('');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const res = await fetch('/api/workspace/backup', {
+        method: 'POST',
+        body: formData,
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        setProfileSuccess(data.message || 'Khôi phục dữ liệu thành công!');
+        setTimeout(() => {
+          window.location.reload();
+        }, 1500);
+      } else {
+        setProfileError(data.error || 'Khôi phục thất bại.');
+      }
+    } catch (err: any) {
+      setProfileError('Lỗi kết nối khi gửi bản sao lưu: ' + err.message);
+    } finally {
+      setRestoringBackup(false);
+      e.target.value = '';
+    }
+  };
 
   useEffect(() => {
     if (user) {
@@ -907,6 +947,35 @@ export default function ResponsiveLayout({ children }: { children: React.ReactNo
                       <small style={{ display: 'block', marginTop: '0.25rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
                         Cấu hình API Key cho Workspace này để kích hoạt chức năng viết lại và tối ưu hóa nội dung bằng AI. Để trống sẽ dùng cấu hình mặc định .env của hệ thống.
                       </small>
+                    </div>
+
+                    <hr style={{ border: 'none', borderTop: '1px solid rgba(255, 255, 255, 0.1)', margin: '20px 0' }} />
+                    <h4 style={{ fontSize: '14px', color: '#fff', marginBottom: '8px' }}>💾 Sao lưu & Phục hồi Toàn bộ Dữ liệu</h4>
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      Xuất toàn bộ CSDL SQLite (tài khoản, proxy, kịch bản, leads) và các phiên đăng nhập profile để phòng ngừa mất dữ liệu hoặc chuyển sang máy tính khác.
+                    </p>
+                    <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                      <a
+                        href="/api/workspace/backup"
+                        download
+                        className="btn btn-secondary"
+                        style={{ textDecoration: 'none', padding: '0.45rem 0.85rem', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                      >
+                        📦 Tải bản Sao lưu (Full Backup .zip)
+                      </a>
+                      <label
+                        className="btn btn-secondary"
+                        style={{ cursor: restoringBackup ? 'not-allowed' : 'pointer', padding: '0.45rem 0.85rem', fontSize: '0.8rem', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                      >
+                        {restoringBackup ? '⏳ Đang phục hồi...' : '📥 Khôi phục từ file .zip'}
+                        <input
+                          type="file"
+                          accept=".zip"
+                          style={{ display: 'none' }}
+                          disabled={restoringBackup}
+                          onChange={handleRestoreBackup}
+                        />
+                      </label>
                     </div>
                   </>
                 )}

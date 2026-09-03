@@ -771,6 +771,27 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
                   </div>
                 )}
 
+                {/* Safety & Performance Badge */}
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  padding: '0.65rem 0.9rem',
+                  backgroundColor: 'rgba(59, 130, 246, 0.08)',
+                  border: '1px solid rgba(59, 130, 246, 0.25)',
+                  borderRadius: '8px',
+                  fontSize: '0.78rem',
+                  flexWrap: 'wrap',
+                  gap: '0.5rem'
+                }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', color: '#93c5fd', fontWeight: 600 }}>
+                    🛡️ Multi-Account Rotation & Circuit Breaker chống checkpoint
+                  </span>
+                  <span style={{ color: '#86efac', fontWeight: 600 }}>
+                    ⚡ Dual-Engine GraphQL Stream + Bóc tách SĐT/Zalo tự động
+                  </span>
+                </div>
+
                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '1rem' }}>
                   <button type="submit" className="btn btn-primary" style={{ padding: '0.65rem 2rem', fontSize: '0.9rem', fontWeight: 700 }} disabled={submitting || selectedAccountIds.length === 0}>
                     {submitting ? 'Đang kích hoạt...' : `🚀 KÍCH HOẠT CÀO DỮ LIỆU (${selectedAccountIds.length} NICK)`}

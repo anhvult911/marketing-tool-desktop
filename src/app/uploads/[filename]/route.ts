@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { UPLOADS_DIR } from '@/lib/paths';
 
 export async function GET(
   request: Request,
@@ -10,10 +11,16 @@ export async function GET(
     const resolvedParams = await params;
     const filename = resolvedParams.filename;
     
-    const filePath = path.resolve(process.cwd(), 'public', 'uploads', filename);
+    let filePath = path.resolve(UPLOADS_DIR, filename);
 
     if (!fs.existsSync(filePath)) {
-      return new Response('Không tìm thấy tệp tin.', { status: 404 });
+      // Fallback kiểm tra thư mục public/uploads
+      const fallbackPath = path.resolve(process.cwd(), 'public', 'uploads', filename);
+      if (fs.existsSync(fallbackPath)) {
+        filePath = fallbackPath;
+      } else {
+        return new Response('Không tìm thấy tệp tin.', { status: 404 });
+      }
     }
 
     const fileBuffer = fs.readFileSync(filePath);

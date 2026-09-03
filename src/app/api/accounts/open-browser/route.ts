@@ -1,8 +1,16 @@
 import { NextResponse } from 'next/server';
 import db from '@/lib/db';
-import { chromium } from 'playwright';
+import { chromium as baseChromium } from 'playwright';
+import { launchRobustPersistentContext } from '@/lib/browser-launcher';
 import { killProfileProcesses, XAutomation, FacebookAutomation, checkLoginState, dismissOverlays, handleFacebookCheckpoints } from '../../../../../worker/automation';
 import { getAuthSession } from '@/lib/auth';
+
+const chromium = {
+  ...baseChromium,
+  launchPersistentContext: (userDataDir: string, options?: any) => {
+    return launchRobustPersistentContext(userDataDir, options);
+  },
+};
 
 async function checkLoginStateForPlatform(page: any, platform: string): Promise<boolean> {
   try {

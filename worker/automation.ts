@@ -1,9 +1,18 @@
-import { chromium, BrowserContext, Page } from 'playwright';
+import { chromium as baseChromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import { execSync } from 'child_process';
 import { NetworkScraperEngine } from './network-scraper';
 import { PROFILES_DIR } from '../src/lib/paths';
+import { launchRobustPersistentContext } from '../src/lib/browser-launcher';
+
+// Tự động phát hiện và fallback trình duyệt Playwright sang Edge hoặc Chrome hệ thống nếu thiếu Chromium
+const chromium = {
+  ...baseChromium,
+  launchPersistentContext: (userDataDir: string, options?: any) => {
+    return launchRobustPersistentContext(userDataDir, options);
+  },
+};
 
 // Helper to kill browser processes locking a profile (Tối ưu hóa tốc độ, tránh freeze)
 export function killProfileProcesses(userDataDir: string) {

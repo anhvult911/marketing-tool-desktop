@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, utilityProcess, UtilityProcess, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, utilityProcess, UtilityProcess, Tray, Menu, nativeImage, Notification } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import http from 'http';
@@ -49,6 +49,33 @@ function waitForServer(port: number, timeoutMs: number = 25000): Promise<boolean
   });
 }
 
+function showNotification(title: string, body: string) {
+  try {
+    if (Notification.isSupported()) {
+      const iconPaths = [
+        path.join(__dirname, '../build/icon.png'),
+        path.join(app.getAppPath(), 'build/icon.png'),
+      ];
+      const iconPath = iconPaths.find((p) => fs.existsSync(p));
+      const notification = new Notification({
+        title: title || 'MKT Tools Desktop',
+        body: body || '',
+        icon: iconPath,
+      });
+      notification.show();
+      notification.on('click', () => {
+        if (mainWindow) {
+          if (!mainWindow.isVisible()) mainWindow.show();
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.focus();
+        }
+      });
+    }
+  } catch (err: any) {
+    console.warn('[Main] Không thể hiển thị thông báo:', err.message);
+  }
+}
+
 function startBackgroundWorker(): UtilityProcess | null {
   const possiblePaths = [
     path.join(__dirname, '../dist-worker/worker/worker.js'),
@@ -70,6 +97,12 @@ function startBackgroundWorker(): UtilityProcess | null {
 
     worker.on('spawn', () => {
       console.log('[Main] ✅ Background Worker đã khởi chạy thành công.');
+    });
+
+    worker.on('message', (msg: any) => {
+      if (msg && msg.type === 'notify') {
+        showNotification(msg.title, msg.body);
+      }
     });
 
     worker.on('exit', (code) => {
@@ -109,6 +142,12 @@ function startStandaloneServer(port: number): UtilityProcess | null {
 
     server.on('spawn', () => {
       console.log(`[Main] ✅ Next.js Standalone Server đã khởi chạy.`);
+    });
+
+    server.on('message', (msg: any) => {
+      if (msg && msg.type === 'notify') {
+        showNotification(msg.title, msg.body);
+      }
     });
 
     server.on('exit', (code) => {
@@ -233,6 +272,18 @@ async function createWindow() {
 
   mainWindow.loadURL(appUrl);
 
+  // Auto-retry reload if Next.js dev server is compiling or temporarily restarting
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    if (isDev && (errorCode === -102 || errorDescription.includes('CONNECTION_REFUSED'))) {
+      console.log(`[Main] Next.js dev server đang khởi động lại hoặc chưa sẵn sàng (${errorDescription}). Tự động kết nối lại sau 1.5s...`);
+      setTimeout(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL(validatedURL || appUrl);
+        }
+      }, 1500);
+    }
+  });
+
   // External link handler
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
@@ -343,4 +394,10 @@ ipcMain.handle('shell:open-external', async (_event, url: string) => {
   if (url.startsWith('http://') || url.startsWith('https://')) {
     await shell.openExternal(url);
   }
+});
+
+// IPC Handler: Bắn thông báo Windows Native Toast Notification
+ipcMain.handle('app:notify', (_event, { title, body }: { title: string; body: string }) => {
+  showNotification(title, body);
+  return { success: true };
 });

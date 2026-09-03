@@ -10,6 +10,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   
   // Open external links
   openExternal: (url: string) => ipcRenderer.invoke('shell:open-external', url),
+
+  // Native Toast Notifications
+  notify: (title: string, body: string) => ipcRenderer.invoke('app:notify', { title, body }),
   
   // Auto-updater events
   onUpdateAvailable: (callback: (info: any) => void) => {

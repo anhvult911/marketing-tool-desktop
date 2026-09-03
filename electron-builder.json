@@ -2,6 +2,7 @@
   "appId": "com.mkttools.desktop",
   "productName": "MKT Tools Desktop",
   "copyright": "Copyright © 2026 MKT Tools",
+  "npmRebuild": false,
   "directories": {
     "output": "dist",
     "buildResources": "build"

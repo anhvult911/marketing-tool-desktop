@@ -25,7 +25,8 @@ async function start() {
   console.log('🚀 Next.js is ready! Building electron & worker files...');
   const { execSync } = require('child_process');
   try {
-    execSync('npm run build:electron && npm run build:worker', { stdio: 'inherit' });
+    execSync('npm run build:electron', { stdio: 'inherit' });
+    execSync('npm run build:worker', { stdio: 'inherit' });
   } catch (err: any) {
     console.warn('[Dev-Runner] Build warning:', err.message);
   }

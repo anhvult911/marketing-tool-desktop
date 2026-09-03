@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import db from '@/lib/db';
 import { getAuthSession } from '@/lib/auth';
 import { runFacebookScrapeJob, stopScrapeJob } from '@/lib/facebook-crawler';
+import { runTelegramScrapeJob, stopTelegramScrapeJob } from '@/lib/telegram-crawler';
 
 export async function GET(request: Request) {
   try {
@@ -92,7 +93,25 @@ export async function POST(request: Request) {
           customTag: customTag ? customTag.trim() : undefined,
           targetCampaignId
         }).catch(err => {
-          console.error(`[Scrape Route] Worker error on job #${newJobId}:`, err);
+          console.error(`[Scrape Route] Facebook Worker error on job #${newJobId}:`, err);
+        });
+      }, 100);
+    } else if (platform === 'telegram') {
+      setTimeout(() => {
+        runTelegramScrapeJob({
+          jobId: newJobId,
+          workspaceId,
+          platform,
+          targetGroup: targetGroup.trim(),
+          accountId: accountId || (accountIds && accountIds.length > 0 ? accountIds[0] : undefined),
+          accountIds,
+          maxLimit,
+          autoImport: !!autoImport,
+          scrapeType,
+          customTag: customTag ? customTag.trim() : undefined,
+          targetCampaignId
+        }).catch(err => {
+          console.error(`[Scrape Route] Telegram Worker error on job #${newJobId}:`, err);
         });
       }, 100);
     }
@@ -141,6 +160,22 @@ export async function PUT(request: Request) {
             targetCampaignId: job.target_campaign_id
           }).catch(err => console.error(err));
         }, 100);
+      } else if (job.platform === 'telegram') {
+        setTimeout(() => {
+          runTelegramScrapeJob({
+            jobId: job.id,
+            workspaceId,
+            platform: job.platform,
+            targetGroup: job.target_group,
+            accountId: job.account_id,
+            accountIds: job.account_ids ? JSON.parse(job.account_ids) : undefined,
+            maxLimit: job.max_limit || 5000,
+            autoImport: !!job.auto_import,
+            scrapeType: job.scrape_type || 'hybrid',
+            customTag: job.custom_tag,
+            targetCampaignId: job.target_campaign_id
+          }).catch(err => console.error(err));
+        }, 100);
       }
 
       return NextResponse.json({ success: true, message: 'Đã chạy lại tác vụ cào dữ liệu thành công.' });
@@ -148,6 +183,7 @@ export async function PUT(request: Request) {
 
     if (action === 'stop' || action === 'cancel') {
       stopScrapeJob(jobId);
+      stopTelegramScrapeJob(jobId);
       db.prepare(`UPDATE scrape_jobs SET status = 'stopped' WHERE id = ? AND workspace_id = ?`).run(jobId, workspaceId);
       return NextResponse.json({ success: true, message: 'Đã gửi lệnh dừng tiến trình cào.' });
     }
@@ -169,6 +205,7 @@ export async function DELETE(request: Request) {
     }
 
     stopScrapeJob(jobId);
+    stopTelegramScrapeJob(jobId);
     db.prepare(`DELETE FROM scraped_job_leads WHERE job_id = ? AND workspace_id = ?`).run(jobId, workspaceId);
     db.prepare(`DELETE FROM scrape_jobs WHERE id = ? AND workspace_id = ?`).run(jobId, workspaceId);
     

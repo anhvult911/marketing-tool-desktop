@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import db from './db';
 import { browserLimiter } from './concurrency';
+import { sendDesktopNotification } from './notify';
 
 export interface ScrapeJobOptions {
   jobId: number;
@@ -25,6 +26,7 @@ export interface ExtractedLead {
   profileUrl?: string;
   interactionType: string;
   postUrl?: string;
+  phone?: string;
 }
 
 // Active jobs map to support cancelling/stopping jobs
@@ -38,11 +40,26 @@ export function stopScrapeJob(jobId: number) {
 }
 
 /**
+ * Clean lockfiles on Windows to prevent Playwright persistent profile launch failure (EBUSY / EPERM)
+ */
+export function unlockProfileDir(userDataDir: string) {
+  try {
+    if (!userDataDir || !fs.existsSync(userDataDir)) return;
+    const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'lockfile'];
+    for (const lf of lockFiles) {
+      const lockPath = path.join(userDataDir, lf);
+      if (fs.existsSync(lockPath)) {
+        try { fs.unlinkSync(lockPath); } catch {}
+      }
+    }
+  } catch {}
+}
+
+/**
  * Clean and extract Facebook vanity or ID from URL / input
  */
 export function parseFacebookTarget(input: string): { type: 'page' | 'group' | 'post'; identifier: string; cleanUrl: string } {
-  let target = input.trim();
-  target = target.replace(/^@/, '');
+  let target = input.trim().replace(/^@/, '');
 
   if (!target.startsWith('http://') && !target.startsWith('https://')) {
     if (target.includes('groups/')) {
@@ -92,7 +109,6 @@ export function extractUidFromFacebookLink(link: string): string {
       return url.searchParams.get('id')!;
     }
 
-    // Check pathname
     const pathname = url.pathname.replace(/^\/|\/$/g, '');
     const parts = pathname.split('/').filter(Boolean);
     
@@ -106,7 +122,8 @@ export function extractUidFromFacebookLink(link: string): string {
     
     if (parts.length > 0) {
       const first = parts[0];
-      if (first !== 'groups' && first !== 'pages' && first !== 'people' && first !== 'watch' && first !== 'events' && first !== 'photo.php' && first !== 'video.php') {
+      const skipSlugs = ['groups', 'pages', 'people', 'watch', 'events', 'photo.php', 'video.php', 'reel', 'story.php', 'marketplace'];
+      if (!skipSlugs.includes(first)) {
         return first;
       }
       if (parts.length > 1 && (first === 'pages' || first === 'people')) {
@@ -115,7 +132,6 @@ export function extractUidFromFacebookLink(link: string): string {
     }
   } catch {}
   
-  // Extract trailing digits from /user/12345 if any
   const matchDigits = link.match(/\/user\/(\d+)/);
   if (matchDigits) return matchDigits[1];
 
@@ -123,12 +139,56 @@ export function extractUidFromFacebookLink(link: string): string {
 }
 
 /**
- * Setup Playwright Context with cookies / persistent profile
+ * Extract Vietnamese Phone numbers from raw text (comments, descriptions, bios)
  */
-async function setupBrowserContext(accountId?: number): Promise<{ context: BrowserContext; isPersistent: boolean }> {
+export function extractVietnamesePhones(text: string): string[] {
+  if (!text) return [];
+  const phoneRegex = /(?:(?:\+84|84|0)(?:3[2-9]|5[25689]|7[06-9]|8[1-9]|9[0-9]))\d{7}\b/g;
+  const matches = text.match(phoneRegex) || [];
+  const uniquePhones = new Set<string>();
+
+  for (let p of matches) {
+    p = p.replace(/\D/g, '');
+    if (p.startsWith('84')) {
+      p = '0' + p.substring(2);
+    }
+    if (p.length === 10) {
+      uniquePhones.add(p);
+    }
+  }
+
+  return Array.from(uniquePhones);
+}
+
+/**
+ * Check if the current page has hit Facebook Checkpoint, Lock or Temporary Block
+ */
+export function detectFacebookCheckpoint(url: string, pageContent: string): boolean {
+  if (url.includes('/checkpoint/') || url.includes('login') || url.includes('disabled') || url.includes('temporarily_blocked')) {
+    return true;
+  }
+  const text = (pageContent || '').toLowerCase();
+  if (
+    text.includes('tài khoản của bạn tạm thời bị khóa') ||
+    text.includes('bạn tạm thời bị chặn') ||
+    text.includes('you’re temporarily blocked') ||
+    text.includes('vui lòng xác nhận danh tính') ||
+    text.includes('confirm your identity') ||
+    text.includes('hành động bị chặn')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Setup Playwright Context with Stealth and Anti-Detection Measures
+ */
+async function setupStealthBrowserContext(accountId?: number): Promise<{ context: BrowserContext; isPersistent: boolean; accountUsername: string }> {
   let profileDir = '';
   let cookiesToInject: any[] = [];
   let proxyConfig: any = undefined;
+  let username = 'Guest';
 
   if (accountId) {
     const acc = db.prepare(`
@@ -140,8 +200,10 @@ async function setupBrowserContext(accountId?: number): Promise<{ context: Brows
     `).get(accountId) as any;
 
     if (acc) {
+      username = acc.username || `Account_${acc.id}`;
       if (acc.user_data_dir && fs.existsSync(acc.user_data_dir)) {
         profileDir = acc.user_data_dir;
+        unlockProfileDir(profileDir);
       }
 
       if (acc.host && acc.port) {
@@ -193,494 +255,422 @@ async function setupBrowserContext(accountId?: number): Promise<{ context: Brows
 
   const defaultUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-infobars',
+    '--disable-dev-shm-usage',
+    '--window-position=0,0',
+    '--lang=vi-VN,vi,en-US,en'
+  ];
+
+  let context: BrowserContext;
+  let isPersistent = false;
+
   if (profileDir && fs.existsSync(profileDir)) {
-    const context = await chromium.launchPersistentContext(profileDir, {
+    context = await chromium.launchPersistentContext(profileDir, {
       headless: true,
-      viewport: { width: 1280, height: 800 },
+      viewport: { width: 1366, height: 768 },
       userAgent: defaultUserAgent,
       proxy: proxyConfig,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Ho_Chi_Minh',
+      args: launchArgs,
     });
-    if (cookiesToInject.length > 0) {
-      await context.addCookies(cookiesToInject);
-    }
-    return { context, isPersistent: true };
+    isPersistent = true;
   } else {
     const browser = await chromium.launch({
       headless: true,
       proxy: proxyConfig,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
+      args: launchArgs,
     });
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 800 },
+    context = await browser.newContext({
+      viewport: { width: 1366, height: 768 },
       userAgent: defaultUserAgent,
+      locale: 'vi-VN',
+      timezoneId: 'Asia/Ho_Chi_Minh',
     });
-    if (cookiesToInject.length > 0) {
-      await context.addCookies(cookiesToInject);
-    }
-    return { context, isPersistent: false };
+    isPersistent = false;
   }
+
+  // Inject Stealth Anti-Detection Script
+  await context.addInitScript(() => {
+    try {
+      // 1. Mask navigator.webdriver
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+
+      // 2. Mock chrome runtime
+      (window as any).chrome = {
+        runtime: {},
+        loadTimes: function() {},
+        csi: function() {},
+        app: {}
+      };
+
+      // 3. Mock plugins
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => [1, 2, 3, 4, 5],
+      });
+
+      // 4. Mock languages
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['vi-VN', 'vi', 'en-US', 'en'],
+      });
+    } catch {}
+  });
+
+  if (cookiesToInject.length > 0) {
+    try {
+      await context.addCookies(cookiesToInject);
+    } catch {}
+  }
+
+  return { context, isPersistent, accountUsername: username };
 }
 
 /**
- * Main Scrape Job Execution Function
+ * Facebook GraphQL Response Interceptor: Parses Group Members, Followers, Reactors, Comments
+ */
+function parseFacebookGraphQLText(rawText: string): ExtractedLead[] {
+  const leads: ExtractedLead[] = [];
+  if (!rawText) return leads;
+
+  let cleaned = rawText.trim();
+  if (cleaned.startsWith('for (;;);')) {
+    cleaned = cleaned.substring('for (;;);'.length).trim();
+  }
+
+  const extractFromConnection = (conn: any, type: string) => {
+    if (!conn) return;
+    const items = conn.edges || conn.nodes || [];
+    for (const item of items) {
+      const node = item.node || item.user || item;
+      if (node && (node.id || node.url || node.profile_url)) {
+        const id = (node.id || '').toString();
+        if (id.startsWith('Y29tbWVud') || id.startsWith('feedback:') || id.startsWith('comment:')) continue;
+        
+        let name = (node.name || node.title?.text || node.text || '').trim();
+        if (!name && typeof node.title === 'string') name = node.title.trim();
+        if (!name || name.startsWith('#') || name.includes('\n')) continue;
+
+        const profileUrl = node.url || node.profile_url || (id ? `https://facebook.com/${id}` : '');
+        const avatar = node.profile_picture?.uri || node.profile_picture_depth_0?.uri || node.profile_picture_50?.uri || node.avatar_url || undefined;
+        
+        if (id || profileUrl) {
+          leads.push({
+            uid: id || extractUidFromFacebookLink(profileUrl),
+            displayName: name,
+            avatarUrl: avatar,
+            profileUrl: profileUrl || `https://facebook.com/${id}`,
+            interactionType: type,
+          });
+        }
+      }
+    }
+  };
+
+  const tryParseChunk = (chunk: string) => {
+    try {
+      const json = JSON.parse(chunk);
+      // Group Members
+      extractFromConnection(json?.data?.node?.all_members, 'group_member');
+      extractFromConnection(json?.data?.node?.group_member_list, 'group_member');
+      extractFromConnection(json?.data?.node?.admin_and_moderator_members, 'admin_moderator');
+      extractFromConnection(json?.data?.node?.members_with_things_in_common, 'common_member');
+      extractFromConnection(json?.data?.node?.new_members, 'new_member');
+      extractFromConnection(json?.data?.node?.search_results, 'search_member');
+      extractFromConnection(json?.data?.node?.group_search_results, 'search_member');
+
+      // Sections
+      const sections = json?.data?.node?.sections || json?.data?.sections || [];
+      if (Array.isArray(sections)) {
+        for (const sec of sections) {
+          extractFromConnection(sec?.items, 'group_member');
+          extractFromConnection(sec?.member_list, 'group_member');
+        }
+      }
+
+      // Followers / Subscribers
+      extractFromConnection(json?.data?.node?.subscribers, 'follower');
+      extractFromConnection(json?.data?.node?.followers, 'follower');
+      extractFromConnection(json?.data?.node?.page_followers, 'follower');
+      extractFromConnection(json?.data?.node?.page_items, 'follower');
+      extractFromConnection(json?.data?.user?.subscribers, 'follower');
+      extractFromConnection(json?.data?.user?.followers, 'follower');
+
+      // Post Reactors
+      const reactors = json?.data?.node?.reactors || json?.data?.feedback?.reactors || json?.data?.node?.top_reactors;
+      extractFromConnection(reactors, 'reaction_like');
+
+      // Comments
+      const comments = json?.data?.node?.commentators || json?.data?.feedback?.comments;
+      if (comments) {
+        const edges = comments.edges || comments.nodes || [];
+        for (const edge of edges) {
+          const node = edge.node || edge;
+          const author = node.author || node.comment_author;
+          if (author) {
+            const uid = (author.id || '').toString();
+            const name = (author.name || '').trim();
+            if (uid && name) {
+              leads.push({
+                uid,
+                displayName: name,
+                avatarUrl: author.profile_picture?.uri || undefined,
+                profileUrl: author.url || `https://facebook.com/${uid}`,
+                interactionType: 'comment',
+              });
+            }
+          }
+        }
+      }
+    } catch {}
+  };
+
+  if (cleaned.includes('\n{"') || cleaned.includes('\n{ "')) {
+    cleaned.split('\n').forEach(line => {
+      const lineTrim = line.trim();
+      if (lineTrim.startsWith('{') && lineTrim.endsWith('}')) {
+        tryParseChunk(lineTrim);
+      }
+    });
+  } else {
+    tryParseChunk(cleaned);
+  }
+
+  // Fallback regex pattern matching for UID and name
+  if (leads.length === 0) {
+    const userMatches = Array.from(cleaned.matchAll(/"id"\s*:\s*"(\d{8,20})"[^}]*?"name"\s*:\s*"((?:\\.|[^"\\])+)"/g));
+    for (const match of userMatches) {
+      const uid = match[1];
+      let name = match[2] || '';
+      try { name = JSON.parse(`"${name}"`).trim(); } catch {}
+      if (uid && /^\d{8,20}$/.test(uid) && name && name.length >= 2 && !name.startsWith('#') && !name.includes('\n')) {
+        leads.push({
+          uid,
+          displayName: name,
+          profileUrl: `https://facebook.com/${uid}`,
+          interactionType: 'graphql_lead',
+        });
+      }
+    }
+  }
+
+  return leads;
+}
+
+/**
+ * Main Scrape Job Execution Function with Multi-Account Rotation, Stealth & Dual-Engine
  */
 export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<void> {
   return browserLimiter.run(async () => {
-    const { jobId, workspaceId, targetGroup, accountId, maxLimit, autoImport, customTag, targetCampaignId, scrapeType } = options;
+    const { jobId, workspaceId, targetGroup, maxLimit, autoImport, customTag, scrapeType } = options;
 
     const cancelSignal = { cancelled: false };
     activeJobSignals.set(jobId, cancelSignal);
 
-  // Update job status to processing
-  db.prepare(`UPDATE scrape_jobs SET status = 'processing', error_msg = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(jobId);
+    // Update job status to processing
+    db.prepare(`UPDATE scrape_jobs SET status = 'processing', error_msg = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(jobId);
 
-  let browserContext: BrowserContext | null = null;
-  let isPersistentCtx = false;
-  let scrapedCount = 0;
-  const collectedUids = new Set<string>();
+    let scrapedCount = 0;
+    let phoneCount = 0;
+    const collectedUids = new Set<string>();
+    const collectedPhones = new Set<string>();
 
-  const insertLeadStmt = db.prepare(`
-    INSERT OR IGNORE INTO scraped_job_leads (job_id, workspace_id, platform, uid, display_name, avatar_url, profile_url, interaction_type, post_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+    const insertLeadStmt = db.prepare(`
+      INSERT OR IGNORE INTO scraped_job_leads (job_id, workspace_id, platform, uid, display_name, avatar_url, profile_url, interaction_type, post_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
 
-  const insertSpamLeadStmt = db.prepare(`
-    INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
-    VALUES (?, 'facebook', 'uid', ?, ?, ?, 'pending', ?)
-  `);
+    const insertSpamLeadStmt = db.prepare(`
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
+      VALUES (?, 'facebook', 'uid', ?, ?, ?, 'pending', ?)
+    `);
 
-  const parsedTarget = parseFacebookTarget(targetGroup);
-  const targetTag = customTag && customTag.trim() ? customTag.trim() : `KOL_${parsedTarget.identifier}`;
+    const insertPhoneLeadStmt = db.prepare(`
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
+      VALUES (?, 'zalo', 'phone', ?, ?, NULL, 'pending', ?)
+    `);
 
-  const saveLeadBatch = (leads: ExtractedLead[]) => {
-    if (leads.length === 0) return;
-    const tx = db.transaction(() => {
-      for (const lead of leads) {
-        if (!lead.uid || collectedUids.has(lead.uid.toLowerCase())) continue;
-        collectedUids.add(lead.uid.toLowerCase());
+    const parsedTarget = parseFacebookTarget(targetGroup);
+    const targetTag = customTag && customTag.trim() ? customTag.trim() : `KOL_${parsedTarget.identifier}`;
 
-        const profileLink = lead.profileUrl || `https://www.facebook.com/${lead.uid}`;
-        insertLeadStmt.run(
-          jobId,
-          workspaceId,
-          'facebook',
-          lead.uid,
-          lead.displayName || lead.uid,
-          lead.avatarUrl || null,
-          profileLink,
-          lead.interactionType || 'engaged_fan',
-          lead.postUrl || null
-        );
+    const saveLeadBatch = (leads: ExtractedLead[]) => {
+      if (leads.length === 0) return;
+      const tx = db.transaction(() => {
+        for (const lead of leads) {
+          if (!lead.uid || collectedUids.has(lead.uid.toLowerCase())) continue;
+          collectedUids.add(lead.uid.toLowerCase());
 
-        if (autoImport) {
-          insertSpamLeadStmt.run(
+          const profileLink = lead.profileUrl || `https://www.facebook.com/${lead.uid}`;
+          insertLeadStmt.run(
+            jobId,
             workspaceId,
+            'facebook',
             lead.uid,
             lead.displayName || lead.uid,
             lead.avatarUrl || null,
-            targetTag
+            profileLink,
+            lead.interactionType || 'engaged_fan',
+            lead.postUrl || null
           );
-        }
 
-        scrapedCount++;
-      }
-    });
+          if (autoImport) {
+            insertSpamLeadStmt.run(
+              workspaceId,
+              lead.uid,
+              lead.displayName || lead.uid,
+              lead.avatarUrl || null,
+              targetTag
+            );
+          }
 
-    tx();
+          scrapedCount++;
 
-    db.prepare(`UPDATE scrape_jobs SET total_count = ?, scraped_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
-      scrapedCount,
-      scrapedCount,
-      jobId
-    );
-  };
-
-  try {
-    const { context, isPersistent } = await setupBrowserContext(accountId);
-    browserContext = context;
-    isPersistentCtx = isPersistent;
-
-    const page = await browserContext.newPage();
-
-    // Set standard timeouts
-    page.setDefaultTimeout(30000);
-    page.setDefaultNavigationTimeout(45000);
-
-    console.log(`[FB Scraper] Starting scrape for job #${jobId}: ${parsedTarget.cleanUrl} (Type: ${parsedTarget.type})`);
-
-    // MODE 1: Group Members Scraping
-    if (parsedTarget.type === 'group' || scrapeType === 'members') {
-      const groupMembersUrl = `${parsedTarget.cleanUrl}/members`;
-      await page.goto(groupMembersUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.waitForTimeout(3000);
-
-      let scrollAttempts = 0;
-      let lastCount = 0;
-
-      while (!cancelSignal.cancelled && scrapedCount < maxLimit && scrollAttempts < 100) {
-        const batchLeads = await page.evaluate(() => {
-          const leads: { href: string; name: string; avatar: string }[] = [];
-          const links = document.querySelectorAll('a[role="link"], a[tabindex="0"]');
-          links.forEach((a: any) => {
-            const href = a.getAttribute('href') || '';
-            const text = (a.innerText || '').trim();
-            if (
-              href.includes('/user/') ||
-              href.includes('/profile.php?id=') ||
-              (href.startsWith('/') && !href.includes('/groups/') && !href.includes('/hashtag/') && text.length > 2 && text.length < 50)
-            ) {
-              const img = a.querySelector('img') || a.parentElement?.querySelector('img');
-              const avatar = img?.getAttribute('src') || '';
-              leads.push({
-                href,
-                name: text.split('\n')[0] || '',
-                avatar,
-              });
+          // If lead has a phone number extracted
+          if (lead.phone && !collectedPhones.has(lead.phone)) {
+            collectedPhones.add(lead.phone);
+            phoneCount++;
+            if (autoImport) {
+              insertPhoneLeadStmt.run(
+                workspaceId,
+                lead.phone,
+                lead.displayName || `Khách hàng ${lead.phone}`,
+                `${targetTag}_SĐT`
+              );
             }
-          });
-          return leads;
-        });
-
-        const formatted = batchLeads.map(l => {
-          const uid = extractUidFromFacebookLink(l.href);
-          return {
-            uid,
-            displayName: l.name || uid,
-            avatarUrl: l.avatar,
-            profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
-            interactionType: 'group_member',
-          };
-        }).filter(l => l.uid && l.uid.length > 2 && !l.uid.includes('help') && !l.uid.includes('privacy'));
-
-        saveLeadBatch(formatted);
-
-        if (scrapedCount === lastCount) {
-          scrollAttempts++;
-        } else {
-          scrollAttempts = 0;
-          lastCount = scrapedCount;
-        }
-
-        // Scroll down
-        await page.evaluate(() => window.scrollBy(0, 1200));
-        await page.waitForTimeout(1500 + Math.floor(Math.random() * 1000));
-      }
-
-    } else {
-      // MODE 2: Multi-Vector Fanpage 360° All-in-One Harvester (Followers + Reactions + Comments + Bio Group)
-      
-      // Step 2.0: Try scanning page followers list
-      const followersPageUrl = `${parsedTarget.cleanUrl}/followers`;
-      try {
-        await page.goto(followersPageUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
-        await page.waitForTimeout(2500);
-
-        let followerScrolls = 0;
-        while (!cancelSignal.cancelled && followerScrolls < 10 && scrapedCount < maxLimit) {
-          const followerLeads = await page.evaluate(() => {
-            const list: { href: string; name: string; avatar: string }[] = [];
-            const links = document.querySelectorAll('a[role="link"], a[tabindex="0"]');
-            links.forEach((a: any) => {
-              const href = a.getAttribute('href') || '';
-              const text = (a.innerText || '').trim();
-              if (
-                href.includes('/user/') ||
-                href.includes('/profile.php?id=') ||
-                (href.startsWith('/') && !href.includes('/groups/') && !href.includes('/hashtag/') && text.length > 2 && text.length < 50)
-              ) {
-                const img = a.querySelector('img') || a.parentElement?.querySelector('img');
-                list.push({ href, name: text.split('\n')[0], avatar: img?.getAttribute('src') || '' });
-              }
-            });
-            return list;
-          });
-
-          const formattedFollowers = followerLeads.map(l => {
-            const uid = extractUidFromFacebookLink(l.href);
-            return {
-              uid,
-              displayName: l.name || uid,
-              avatarUrl: l.avatar,
-              profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
-              interactionType: 'follower',
-            };
-          }).filter(l => l.uid && l.uid.length > 2);
-
-          saveLeadBatch(formattedFollowers);
-          await page.evaluate(() => window.scrollBy(0, 1000));
-          await page.waitForTimeout(1200);
-          followerScrolls++;
-        }
-      } catch (err: any) {
-        console.log(`[FB Scraper] Followers tab direct scan passed:`, err.message);
-      }
-
-      // Navigate to Fanpage Main Feed
-      await page.goto(parsedTarget.cleanUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await page.waitForTimeout(3000);
-
-      // Step 2.1: Extract Bio for linked Facebook groups using DOM, Regex & Bio Aggregators (beacons.ai, linktree...)
-      const bioInfo = await page.evaluate(() => {
-        const groups: string[] = [];
-        const aggregators: string[] = [];
-        const pageHtml = document.body.innerHTML || '';
-        
-        // Match facebook.com/groups/xxx or /groups/xxx
-        const groupRegex = /(?:facebook\.com\/groups\/|groups\/)([a-zA-Z0-9._-]+)/g;
-        let match;
-        while ((match = groupRegex.exec(pageHtml)) !== null) {
-          const gId = match[1];
-          if (gId && !['feed', 'discover', 'joins', 'create'].includes(gId) && !groups.includes(gId)) {
-            groups.push(gId);
           }
         }
-
-        // Check all <a> tags for groups or aggregator links (beacons.ai, linktr.ee, etc.)
-        const anchors = document.querySelectorAll('a[href]');
-        anchors.forEach((a: any) => {
-          const href = a.getAttribute('href') || '';
-          if (href.includes('groups/')) {
-            const parts = href.split('groups/')[1]?.split('/')[0]?.split('?')[0];
-            if (parts && !groups.includes(parts)) groups.push(parts);
-          }
-          if (href.includes('beacons.ai/') || href.includes('linktr.ee/') || href.includes('bio.link/') || href.includes('taplink.cc/')) {
-            if (!aggregators.includes(href)) aggregators.push(href);
-          }
-        });
-
-        return { groups, aggregators };
       });
 
-      const detectedGroupIds: string[] = [...bioInfo.groups];
+      tx();
 
-      // If Bio has an aggregator link (like beacons.ai/phk10x), inspect it in a tab to discover hidden groups!
-      if (bioInfo.aggregators.length > 0) {
-        for (const aggUrl of bioInfo.aggregators.slice(0, 2)) {
-          try {
-            console.log(`[FB Scraper] Inspecting bio aggregator link: ${aggUrl}`);
-            const aggPage = await browserContext.newPage();
-            await aggPage.goto(aggUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-            await aggPage.waitForTimeout(2000);
+      const actualTotal = (db.prepare(`SELECT count(*) as count FROM scraped_job_leads WHERE job_id = ?`).get(jobId) as any)?.count || scrapedCount;
 
-            const aggGroups = await aggPage.evaluate(() => {
-              const found: string[] = [];
-              const html = document.body.innerHTML || '';
-              const gRegex = /(?:facebook\.com\/groups\/|groups\/)([a-zA-Z0-9._-]+)/g;
-              let m;
-              while ((m = gRegex.exec(html)) !== null) {
-                const id = m[1];
-                if (id && !['feed', 'discover', 'joins', 'create'].includes(id) && !found.includes(id)) {
-                  found.push(id);
-                }
-              }
-              return found;
-            });
+      db.prepare(`UPDATE scrape_jobs SET total_count = ?, scraped_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
+        actualTotal,
+        actualTotal,
+        jobId
+      );
+    };
 
-            for (const g of aggGroups) {
-              if (!detectedGroupIds.includes(g)) detectedGroupIds.push(g);
-            }
-            await aggPage.close();
-          } catch (e: any) {
-            console.log(`[FB Scraper] Aggregator inspection skipped:`, e.message);
-          }
-        }
-      }
+    // Determine account pool queue for Multi-Account Rotation
+    let accountQueue: number[] = [];
+    if (options.accountIds && Array.isArray(options.accountIds) && options.accountIds.length > 0) {
+      accountQueue = [...options.accountIds];
+    } else if (options.accountId) {
+      accountQueue = [options.accountId];
+    } else {
+      // Fallback: pick live Facebook accounts from DB
+      const liveAccs = db.prepare(`
+        SELECT id FROM social_accounts 
+        WHERE workspace_id = ? AND platform = 'facebook' AND status IN ('live', 'ready', 'active')
+        ORDER BY id ASC LIMIT 5
+      `).all(workspaceId) as any[];
+      accountQueue = liveAccs.map(a => a.id);
+    }
 
-      console.log(`[FB Scraper] Total detected groups:`, detectedGroupIds);
+    if (accountQueue.length === 0) {
+      accountQueue = [0]; // Guest mode if no account
+    }
 
-      // Step 2.2: Deep Feed Crawler (Feed Scroll up to 100+ scrolls, with deep reaction dialogs)
-      let feedScrolls = 0;
-      let lastFeedCount = scrapedCount;
+    console.log(`[FB Scraper] Job #${jobId} starting with ${accountQueue.length} account(s) in rotation pool.`);
 
-      while (!cancelSignal.cancelled && feedScrolls < 100 && scrapedCount < maxLimit) {
-        // 2.2.1: Scrape visible commenters on current view
-        const currentFeedLeads = await page.evaluate(() => {
-          const leads: { href: string; name: string; avatar: string; type: string }[] = [];
-          const commentElements = document.querySelectorAll('div[role="article"] a[role="link"], div[aria-label*="Comment"] a[role="link"], div[aria-label*="Bình luận"] a[role="link"]');
-          commentElements.forEach((a: any) => {
-            const href = a.getAttribute('href') || '';
-            const name = (a.innerText || '').trim();
-            if (name && name.length > 2 && name.length < 50 && !href.includes('/posts/') && !href.includes('/photos/') && !href.includes('/groups/')) {
-              const img = a.querySelector('img') || a.parentElement?.querySelector('img');
-              leads.push({ href, name: name.split('\n')[0], avatar: img?.getAttribute('src') || '', type: 'comment' });
-            }
-          });
-          return leads;
-        });
+    let currentAccountIdx = 0;
+    const maxPerAccountQuota = Math.max(300, Math.min(800, Math.ceil(maxLimit / Math.max(1, accountQueue.length))));
 
-        const formattedFeed = currentFeedLeads.map(l => {
-          const uid = extractUidFromFacebookLink(l.href);
-          return {
-            uid,
-            displayName: l.name || uid,
-            avatarUrl: l.avatar,
-            profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
-            interactionType: l.type,
-          };
-        }).filter(l => l.uid && l.uid.length > 2);
+    try {
+      while (!cancelSignal.cancelled && scrapedCount < maxLimit && currentAccountIdx < accountQueue.length) {
+        const currentAccountId = accountQueue[currentAccountIdx];
+        let browserContext: BrowserContext | null = null;
+        let accountSessionCount = 0;
 
-        saveLeadBatch(formattedFeed);
+        console.log(`[FB Scraper] 🔄 Rotating to Account #${currentAccountId} (Session quota: ~${maxPerAccountQuota} leads)`);
 
-        // 2.2.2: Click all unclicked reaction badges visible on feed
-        const openedDialog = await page.evaluate(() => {
-          const reactionBadges = document.querySelectorAll(`
-            span[aria-label*="bày tỏ"], div[aria-label*="bày tỏ"], 
-            span[aria-label*="reaction"], div[aria-label*="reaction"], 
-            div[role="button"][aria-label*="See who reacted"], div[role="button"][aria-label*="Xem ai"], 
-            span[aria-label*="người khác"], span[aria-label*="others"], 
-            span[aria-label*="Thích, yêu thích"], div[aria-label*="Thích, yêu thích"], 
-            span[aria-label*="Like, love"], div[aria-label*="Like, love"]
-          `);
-          for (const btn of Array.from(reactionBadges)) {
-            const el = btn as HTMLElement;
-            if (el && !el.dataset.scraped) {
-              el.dataset.scraped = 'true';
-              el.click();
-              return true;
-            }
-          }
-          return false;
-        });
-
-        if (openedDialog) {
-          await page.waitForTimeout(2000);
-
-          let dialogScrolls = 0;
-          let lastDialogCount = scrapedCount;
-          let dialogStallCount = 0;
-
-          while (!cancelSignal.cancelled && dialogScrolls < 50 && scrapedCount < maxLimit && dialogStallCount < 4) {
-            const dialogUsers = await page.evaluate(() => {
-              const users: { href: string; name: string; avatar: string }[] = [];
-              const dialog = document.querySelector('div[role="dialog"]');
-              if (dialog) {
-                const userAnchors = dialog.querySelectorAll('a[role="link"], a[tabindex="0"]');
-                userAnchors.forEach((a: any) => {
-                  const href = a.getAttribute('href') || '';
-                  const name = (a.innerText || '').trim();
-                  if (name && name.length > 2 && name.length < 50 && !href.includes('/posts/') && !href.includes('/photos/')) {
-                    const img = a.querySelector('img') || a.parentElement?.querySelector('img');
-                    users.push({
-                      href,
-                      name: name.split('\n')[0],
-                      avatar: img?.getAttribute('src') || '',
-                    });
-                  }
-                });
-              }
-              return users;
-            });
-
-            const formattedReactors = dialogUsers.map(u => {
-              const uid = extractUidFromFacebookLink(u.href);
-              return {
-                uid,
-                displayName: u.name || uid,
-                avatarUrl: u.avatar,
-                profileUrl: u.href.startsWith('http') ? u.href : `https://www.facebook.com${u.href}`,
-                interactionType: 'reaction_like',
-              };
-            }).filter(u => u.uid && u.uid.length > 2);
-
-            saveLeadBatch(formattedReactors);
-
-            if (scrapedCount === lastDialogCount) {
-              dialogStallCount++;
-            } else {
-              dialogStallCount = 0;
-              lastDialogCount = scrapedCount;
-            }
-
-            // Scroll the reaction dialog container
-            await page.evaluate(() => {
-              const dialogBody = document.querySelector('div[role="dialog"] div[style*="overflow"], div[role="dialog"] div[tabindex="-1"]');
-              if (dialogBody) {
-                dialogBody.scrollBy(0, 900);
-              } else {
-                window.scrollBy(0, 900);
-              }
-            });
-
-            await page.waitForTimeout(900 + Math.floor(Math.random() * 500));
-            dialogScrolls++;
-          }
-
-          // Close the dialog
-          await page.keyboard.press('Escape');
-          await page.waitForTimeout(800);
-        }
-
-        // Scroll main feed
-        await page.evaluate(() => window.scrollBy(0, 1400));
-        await page.waitForTimeout(1600);
-        feedScrolls++;
-      }
-
-      // Step 2.3: Sweep Videos / Reels Tab if still under maxLimit
-      if (!cancelSignal.cancelled && scrapedCount < maxLimit) {
-        const videosUrl = `${parsedTarget.cleanUrl}/videos`;
         try {
-          console.log(`[FB Scraper] Sweeping Videos tab: ${videosUrl}`);
-          await page.goto(videosUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
+          const { context, accountUsername } = await setupStealthBrowserContext(currentAccountId > 0 ? currentAccountId : undefined);
+          browserContext = context;
+
+          const page = await browserContext.newPage();
+          page.setDefaultTimeout(35000);
+          page.setDefaultNavigationTimeout(45000);
+
+          // Attach Dual-Engine GraphQL Network Interceptor
+          const responseListener = async (response: any) => {
+            try {
+              const url = response.url();
+              if (!url.includes('/graphql') && !url.includes('/api/graphql/')) return;
+
+              const postData = response.request()?.postData() || '';
+              // Exclude personal live viewer background chatter
+              if (
+                postData.includes('CometNotifications') ||
+                postData.includes('CometChat') ||
+                postData.includes('Presence') ||
+                postData.includes('NewsFeed') ||
+                postData.includes('Stories')
+              ) {
+                return;
+              }
+
+              const text = await response.text().catch(() => '');
+              if (!text || (!text.includes('"id"') && !text.includes('profile_picture'))) return;
+
+              const parsedLeads = parseFacebookGraphQLText(text);
+              if (parsedLeads.length > 0) {
+                // Auto-detect Vietnamese phones in the payload
+                const foundPhones = extractVietnamesePhones(text);
+                if (foundPhones.length > 0) {
+                  for (let i = 0; i < Math.min(foundPhones.length, parsedLeads.length); i++) {
+                    parsedLeads[i].phone = foundPhones[i];
+                  }
+                }
+
+                saveLeadBatch(parsedLeads);
+                accountSessionCount += parsedLeads.length;
+              }
+            } catch {}
+          };
+
+          page.on('response', responseListener);
+
+          // Navigate to target
+          console.log(`[FB Scraper] Navigating to ${parsedTarget.cleanUrl} via @${accountUsername}...`);
+          await page.goto(parsedTarget.cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
           await page.waitForTimeout(2500);
 
-          let videoScrolls = 0;
-          while (!cancelSignal.cancelled && videoScrolls < 30 && scrapedCount < maxLimit) {
-            const videoLeads = await page.evaluate(() => {
-              const leads: { href: string; name: string; avatar: string }[] = [];
-              const links = document.querySelectorAll('a[role="link"]');
-              links.forEach((a: any) => {
-                const href = a.getAttribute('href') || '';
-                const name = (a.innerText || '').trim();
-                if (name && name.length > 2 && name.length < 50 && !href.includes('/videos/') && !href.includes('/watch/')) {
-                  const img = a.querySelector('img');
-                  leads.push({ href, name: name.split('\n')[0], avatar: img?.getAttribute('src') || '' });
-                }
-              });
-              return leads;
-            });
-
-            const formattedVideoLeads = videoLeads.map(l => {
-              const uid = extractUidFromFacebookLink(l.href);
-              return {
-                uid,
-                displayName: l.name || uid,
-                avatarUrl: l.avatar,
-                profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
-                interactionType: 'video_viewer',
-              };
-            }).filter(l => l.uid && l.uid.length > 2);
-
-            saveLeadBatch(formattedVideoLeads);
-            await page.evaluate(() => window.scrollBy(0, 1200));
-            await page.waitForTimeout(1400);
-            videoScrolls++;
+          // Check for Checkpoint / Account ban
+          const pageHtml = await page.content().catch(() => '');
+          if (detectFacebookCheckpoint(page.url(), pageHtml)) {
+            console.warn(`[FB Scraper] ⚠️ Account #${currentAccountId} hit Checkpoint / Block! Circuit Breaker triggered.`);
+            if (currentAccountId > 0) {
+              db.prepare(`UPDATE social_accounts SET status = 'checkpoint' WHERE id = ?`).run(currentAccountId);
+              sendDesktopNotification(
+                'Tài khoản Facebook bị Checkpoint ⚠️',
+                `Tài khoản #${currentAccountId} (@${accountUsername}) gặp checkpoint. Hệ thống đang tự động đổi sang tài khoản tiếp theo...`
+              );
+            }
+            await browserContext.close();
+            currentAccountIdx++;
+            continue; // Rotate to next account
           }
-        } catch (vErr: any) {
-          console.log(`[FB Scraper] Videos tab scan passed:`, vErr.message);
-        }
-      }
 
-      // Step 2.4: Infiltrate & Scrape Linked Bio Community Group
-      if (!cancelSignal.cancelled && scrapedCount < maxLimit && detectedGroupIds.length > 0) {
-        for (const gId of detectedGroupIds) {
-          if (cancelSignal.cancelled || scrapedCount >= maxLimit) break;
+          // MODE 1: Group Members Scraping (with Prefix Search fallback)
+          if (parsedTarget.type === 'group' || scrapeType === 'members') {
+            const groupMembersUrl = `${parsedTarget.cleanUrl}/members`;
+            await page.goto(groupMembersUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+            await page.waitForTimeout(2500);
 
-          const groupMembersUrl = `https://www.facebook.com/groups/${gId}/members`;
-          console.log(`[FB Scraper] Scraping community group members: ${groupMembersUrl}`);
+            let scrollAttempts = 0;
+            let lastCount = scrapedCount;
 
-          try {
-            await page.goto(groupMembersUrl, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
-            await page.waitForTimeout(3000);
-
-            let groupScrolls = 0;
-            let lastGroupCount = scrapedCount;
-            let groupStallCount = 0;
-
-            while (!cancelSignal.cancelled && scrapedCount < maxLimit && groupScrolls < 120 && groupStallCount < 8) {
-              const groupLeads = await page.evaluate(() => {
-                const list: { href: string; name: string; avatar: string }[] = [];
+            // Phase 1.1: Infinite Scroll
+            while (!cancelSignal.cancelled && scrapedCount < maxLimit && accountSessionCount < maxPerAccountQuota && scrollAttempts < 40) {
+              const domLeads = await page.evaluate(() => {
+                const leads: { href: string; name: string; avatar: string }[] = [];
                 const links = document.querySelectorAll('a[role="link"], a[tabindex="0"]');
                 links.forEach((a: any) => {
                   const href = a.getAttribute('href') || '';
@@ -691,66 +681,279 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
                     (href.startsWith('/') && !href.includes('/groups/') && !href.includes('/hashtag/') && text.length > 2 && text.length < 50)
                   ) {
                     const img = a.querySelector('img') || a.parentElement?.querySelector('img');
-                    list.push({ href, name: text.split('\n')[0], avatar: img?.getAttribute('src') || '' });
+                    leads.push({ href, name: text.split('\n')[0] || '', avatar: img?.getAttribute('src') || '' });
                   }
                 });
-                return list;
+                return leads;
               });
 
-              const formattedGroup = groupLeads.map(l => {
-                const uid = extractUidFromFacebookLink(l.href);
-                return {
-                  uid,
-                  displayName: l.name || uid,
-                  avatarUrl: l.avatar,
-                  profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
-                  interactionType: 'linked_group_member',
-                };
-              }).filter(l => l.uid && l.uid.length > 2 && !l.uid.includes('help') && !l.uid.includes('privacy'));
+              const formatted = domLeads.map(l => ({
+                uid: extractUidFromFacebookLink(l.href),
+                displayName: l.name || 'Facebook User',
+                avatarUrl: l.avatar,
+                profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
+                interactionType: 'group_member',
+              })).filter(l => l.uid && l.uid.length > 2 && !l.uid.includes('help') && !l.uid.includes('privacy'));
 
-              saveLeadBatch(formattedGroup);
+              saveLeadBatch(formatted);
+              accountSessionCount += formatted.length;
 
-              if (scrapedCount === lastGroupCount) {
-                groupStallCount++;
+              if (scrapedCount === lastCount) {
+                scrollAttempts++;
               } else {
-                groupStallCount = 0;
-                lastGroupCount = scrapedCount;
+                scrollAttempts = 0;
+                lastCount = scrapedCount;
               }
 
-              await page.evaluate(() => window.scrollBy(0, 1200));
-              await page.waitForTimeout(1300 + Math.floor(Math.random() * 600));
-              groupScrolls++;
+              // Human-like adaptive scroll
+              await page.evaluate(() => window.scrollBy(0, 1100 + Math.floor(Math.random() * 400)));
+              await page.waitForTimeout(1200 + Math.floor(Math.random() * 800));
             }
-          } catch (gErr: any) {
-            console.error(`[FB Scraper] Error scraping linked group ${gId}:`, gErr.message);
+
+            // Phase 1.2: Prefix Search Expansion if scroll slows down (Unlocks 10,000+ members in large groups)
+            if (!cancelSignal.cancelled && scrapedCount < maxLimit && accountSessionCount < maxPerAccountQuota) {
+              console.log(`[FB Scraper] 🔍 Activating Prefix Search Expansion (A-Z) for Group...`);
+              const searchLetters = ['a', 'b', 'c', 'd', 'e', 'h', 'k', 'm', 'n', 't', 'v'];
+
+              for (const letter of searchLetters) {
+                if (cancelSignal.cancelled || scrapedCount >= maxLimit || accountSessionCount >= maxPerAccountQuota) break;
+
+                try {
+                  const searchInput = await page.$('input[aria-label*="Tìm kiếm"], input[placeholder*="Tìm kiếm"], input[aria-label*="Search"]');
+                  if (searchInput) {
+                    await searchInput.fill(letter);
+                    await page.keyboard.press('Enter');
+                    await page.waitForTimeout(2000);
+
+                    // Scroll search results
+                    for (let s = 0; s < 5; s++) {
+                      await page.evaluate(() => window.scrollBy(0, 1000));
+                      await page.waitForTimeout(1000);
+                    }
+                  }
+                } catch {}
+              }
+            }
+
+          } else {
+            // MODE 2: Multi-Vector Fanpage 360° Harvester (Followers + Reactions + Comments + SĐT Extractor)
+            
+            // Step 2.1: Followers direct scan
+            const followersPageUrl = `${parsedTarget.cleanUrl}/followers`;
+            try {
+              await page.goto(followersPageUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
+              await page.waitForTimeout(2000);
+
+              let fScrolls = 0;
+              while (!cancelSignal.cancelled && fScrolls < 12 && scrapedCount < maxLimit && accountSessionCount < maxPerAccountQuota) {
+                const domFollowers = await page.evaluate(() => {
+                  const list: { href: string; name: string; avatar: string }[] = [];
+                  const links = document.querySelectorAll('a[role="link"], a[tabindex="0"]');
+                  links.forEach((a: any) => {
+                    const href = a.getAttribute('href') || '';
+                    const text = (a.innerText || '').trim();
+                    if (
+                      href.includes('/user/') ||
+                      href.includes('/profile.php?id=') ||
+                      (href.startsWith('/') && !href.includes('/groups/') && text.length > 2 && text.length < 50)
+                    ) {
+                      const img = a.querySelector('img');
+                      list.push({ href, name: text.split('\n')[0], avatar: img?.getAttribute('src') || '' });
+                    }
+                  });
+                  return list;
+                });
+
+                const formatted = domFollowers.map(l => ({
+                  uid: extractUidFromFacebookLink(l.href),
+                  displayName: l.name,
+                  avatarUrl: l.avatar,
+                  profileUrl: l.href.startsWith('http') ? l.href : `https://www.facebook.com${l.href}`,
+                  interactionType: 'follower',
+                })).filter(l => l.uid && l.uid.length > 2);
+
+                saveLeadBatch(formatted);
+                accountSessionCount += formatted.length;
+                await page.evaluate(() => window.scrollBy(0, 1200));
+                await page.waitForTimeout(1200);
+                fScrolls++;
+              }
+            } catch {}
+
+            // Step 2.2: Main Feed Deep Extraction
+            await page.goto(parsedTarget.cleanUrl, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+            await page.waitForTimeout(2500);
+
+            // Expand "All Comments" ("Tất cả bình luận") filter to unlock 95% hidden comments
+            try {
+              await page.evaluate(() => {
+                const filterBtns = document.querySelectorAll('span, div[role="button"]');
+                for (const b of Array.from(filterBtns)) {
+                  const t = (b.textContent || '').trim();
+                  if (t.includes('Phù hợp nhất') || t.includes('Most relevant')) {
+                    (b as HTMLElement).click();
+                    break;
+                  }
+                }
+              });
+              await page.waitForTimeout(1000);
+              await page.evaluate(() => {
+                const menuItems = document.querySelectorAll('div[role="menuitem"], div[role="option"], span');
+                for (const item of Array.from(menuItems)) {
+                  const t = (item.textContent || '').trim();
+                  if (t.includes('Tất cả bình luận') || t.includes('All comments')) {
+                    (item as HTMLElement).click();
+                    break;
+                  }
+                }
+              });
+            } catch {}
+
+            // Feed scrolling loop
+            let feedScrolls = 0;
+            let feedStallCount = 0;
+            let lastFeedCount = scrapedCount;
+            while (!cancelSignal.cancelled && feedScrolls < 60 && scrapedCount < maxLimit && accountSessionCount < maxPerAccountQuota) {
+              // Extract comment leads & phone numbers from DOM
+              const feedLeads = await page.evaluate(() => {
+                const leads: { href: string; name: string; avatar: string; commentText: string }[] = [];
+                const articles = document.querySelectorAll('div[role="article"], div[aria-label*="Comment"], div[aria-label*="Bình luận"]');
+                articles.forEach((art: any) => {
+                  const a = art.querySelector('a[role="link"]');
+                  if (a) {
+                    const href = a.getAttribute('href') || '';
+                    const name = (a.innerText || '').trim();
+                    const commentText = (art.innerText || '').trim();
+                    if (name && name.length > 2 && name.length < 50 && !href.includes('/posts/')) {
+                      const img = art.querySelector('img');
+                      leads.push({ href, name: name.split('\n')[0], avatar: img?.getAttribute('src') || '', commentText });
+                    }
+                  }
+                });
+                return leads;
+              });
+
+              const formattedFeed: ExtractedLead[] = [];
+              for (const fl of feedLeads) {
+                const uid = extractUidFromFacebookLink(fl.href);
+                if (uid && uid.length > 2) {
+                  const phones = extractVietnamesePhones(fl.commentText);
+                  formattedFeed.push({
+                    uid,
+                    displayName: fl.name || uid,
+                    avatarUrl: fl.avatar,
+                    profileUrl: fl.href.startsWith('http') ? fl.href : `https://www.facebook.com${fl.href}`,
+                    interactionType: 'comment',
+                    phone: phones.length > 0 ? phones[0] : undefined
+                  });
+                }
+              }
+
+              saveLeadBatch(formattedFeed);
+              accountSessionCount += formattedFeed.length;
+
+              if (scrapedCount === lastFeedCount) {
+                feedStallCount++;
+              } else {
+                feedStallCount = 0;
+                lastFeedCount = scrapedCount;
+              }
+
+              // Nếu 5 lần cuộn liên tiếp không có thêm dữ liệu -> Đã quét hết trang
+              if (feedStallCount >= 5) {
+                console.log(`[FB Scraper] 🏁 Đã quét cạn toàn bộ bài viết hiển thị trên trang ${parsedTarget.identifier}. Dừng cuộn sớm.`);
+                break;
+              }
+
+              // Click reaction badge if visible to open reactor dialog
+              const openedReactorDialog = await page.evaluate(() => {
+                const reactionBadges = document.querySelectorAll(`
+                  span[aria-label*="bày tỏ"], div[aria-label*="bày tỏ"], 
+                  span[aria-label*="reaction"], div[aria-label*="reaction"], 
+                  div[role="button"][aria-label*="See who reacted"], div[role="button"][aria-label*="Xem ai"]
+                `);
+                for (const btn of Array.from(reactionBadges)) {
+                  const el = btn as HTMLElement;
+                  if (el && !el.dataset.scraped) {
+                    el.dataset.scraped = 'true';
+                    el.click();
+                    return true;
+                  }
+                }
+                return false;
+              });
+
+              if (openedReactorDialog) {
+                await page.waitForTimeout(1800);
+                for (let d = 0; d < 15; d++) {
+                  if (cancelSignal.cancelled) break;
+                  await page.evaluate(() => {
+                    const dialogBody = document.querySelector('div[role="dialog"] div[style*="overflow"], div[role="dialog"] div[tabindex="-1"]');
+                    if (dialogBody) dialogBody.scrollBy(0, 900);
+                  });
+                  await page.waitForTimeout(800 + Math.floor(Math.random() * 400));
+                }
+                await page.keyboard.press('Escape').catch(() => {});
+                await page.waitForTimeout(500);
+              }
+
+              // Click "View more comments"
+              await page.evaluate(() => {
+                const moreBtns = document.querySelectorAll('span');
+                for (const b of Array.from(moreBtns)) {
+                  const t = (b.textContent || '').trim();
+                  if (t.includes('Xem thêm bình luận') || t.includes('View more comments') || t.includes('câu trả lời')) {
+                    (b as HTMLElement).click();
+                    break;
+                  }
+                }
+              });
+
+              await page.evaluate(() => window.scrollBy(0, 1300));
+              await page.waitForTimeout(1400 + Math.floor(Math.random() * 600));
+              feedScrolls++;
+            }
+          }
+
+        } catch (sessionErr: any) {
+          console.error(`[FB Scraper] Session error on Account #${currentAccountId}:`, sessionErr.message);
+        } finally {
+          if (browserContext) {
+            try { await browserContext.close(); } catch {}
           }
         }
+
+        // Account rotation check
+        currentAccountIdx++;
+        if (scrapedCount < maxLimit && currentAccountIdx < accountQueue.length) {
+          console.log(`[FB Scraper] ⏳ Account #${currentAccountId} completed session. Resting 3s before rotating to next account...`);
+          await new Promise(r => setTimeout(r, 3000));
+        }
       }
-    }
 
-    const finalStatus = cancelSignal.cancelled ? 'stopped' : 'completed';
-    db.prepare(`UPDATE scrape_jobs SET status = ?, total_count = ?, scraped_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
-      finalStatus,
-      scrapedCount,
-      scrapedCount,
-      jobId
-    );
+      const actualTotal = (db.prepare(`SELECT count(*) as count FROM scraped_job_leads WHERE job_id = ?`).get(jobId) as any)?.count || scrapedCount;
+      const finalStatus = cancelSignal.cancelled ? 'stopped' : 'completed';
+      db.prepare(`UPDATE scrape_jobs SET status = ?, total_count = ?, scraped_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
+        finalStatus,
+        actualTotal,
+        actualTotal,
+        jobId
+      );
 
-    console.log(`[FB Scraper] Job #${jobId} finished with status: ${finalStatus}. Total leads collected: ${scrapedCount}`);
+      console.log(`[FB Scraper] Job #${jobId} completed! Total leads: ${actualTotal} (Phones: ${phoneCount}). Status: ${finalStatus}`);
+      sendDesktopNotification(
+        'Hoàn tất cào dữ liệu Facebook 🎯',
+        `Job #${jobId} đã thu thập thành công ${actualTotal} leads (${phoneCount} số điện thoại).`
+      );
 
-  } catch (error: any) {
-    console.error(`[FB Scraper] Fatal error executing job #${jobId}:`, error);
-    db.prepare(`UPDATE scrape_jobs SET status = 'failed', error_msg = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
-      error.message || 'Lỗi không xác định trong quá trình cào dữ liệu.',
-      jobId
-    );
+    } catch (error: any) {
+      console.error(`[FB Scraper] Fatal error executing job #${jobId}:`, error);
+      db.prepare(`UPDATE scrape_jobs SET status = 'failed', error_msg = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
+        error.message || 'Lỗi không xác định trong quá trình cào dữ liệu.',
+        jobId
+      );
     } finally {
       activeJobSignals.delete(jobId);
-      if (browserContext) {
-        try {
-          await browserContext.close();
-        } catch {}
-      }
     }
   });
 }

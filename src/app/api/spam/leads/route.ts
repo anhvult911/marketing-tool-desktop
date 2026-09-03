@@ -144,11 +144,16 @@ export async function DELETE(request: Request) {
   try {
     const session = await getAuthSession(request);
     const workspaceId = session?.activeWorkspaceId || 1;
-    const { id, ids, all } = await request.json().catch(() => ({}));
+    const { id, ids, source, all } = await request.json().catch(() => ({}));
 
     if (all) {
       db.prepare(`DELETE FROM spam_leads WHERE workspace_id = ?`).run(workspaceId);
       return NextResponse.json({ success: true, message: 'Đã xóa toàn bộ danh bạ.' });
+    }
+
+    if (source) {
+      db.prepare(`DELETE FROM spam_leads WHERE source = ? AND workspace_id = ?`).run(source, workspaceId);
+      return NextResponse.json({ success: true, message: `Đã xóa toàn bộ Tập Leads "${source}".` });
     }
 
     if (ids && Array.isArray(ids)) {

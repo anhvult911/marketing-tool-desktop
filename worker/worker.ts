@@ -1,6 +1,7 @@
 import db from '../src/lib/db';
 import localQueue from '../src/lib/queue';
 import { browserLimiter } from '../src/lib/concurrency';
+import { sendDesktopNotification } from '../src/lib/notify';
 import { XAutomation, ZaloAutomation, TelegramAutomation, ThreadsAutomation, MockAutomation, NewF319Automation, FacebookAutomation, WhatsAppAutomation } from './automation';
 
 console.log('===================================================');
@@ -129,8 +130,10 @@ async function executeJob(job: any) {
   if (success) {
     localQueue.markCompleted(job.id, postUrl);
     console.log(`[Worker] Job #${job.id} completed successfully.`);
+    sendDesktopNotification('Đăng bài thành công ✅', `Đã xuất bản nội dung #${job.id} cho @${job.username || 'Tài khoản'}`);
   } else {
     localQueue.markFailed(job.id, errorMsg);
+    sendDesktopNotification('Tác vụ thất bại ⚠️', `Job #${job.id} (@${job.username || 'Hệ thống'}): ${errorMsg.slice(0, 80)}`);
   }
 }
 
