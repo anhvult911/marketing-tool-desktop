@@ -3,6 +3,7 @@ import fs from 'fs';
 import db, { getSetting } from './db';
 import { telegramScrapeLimiter, ConcurrencyLimiter } from './concurrency';
 import { extractVietnamesePhones } from './lead-utils';
+import { normalizeLeadValue } from './lead-normalize';
 import { buildSearchBuckets, allWorkItems, WorkProgress, telegramLeadKey } from './telegram-buckets';
 import { sendDesktopNotification } from './notify';
 import { unlockProfileDir } from './profile-lock';
@@ -89,20 +90,31 @@ export async function runTelegramScrapeJob(options: TelegramScrapeOptions): Prom
       INSERT OR IGNORE INTO scraped_job_leads (job_id, workspace_id, platform, uid, display_name, avatar_url, profile_url, interaction_type, post_url)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
+    // P4 — chèn kèm khoá chuẩn hoá + chặn trùng ngữ nghĩa (@User vs t.me/user,
+    // 090… vs +8490…). WHERE NOT EXISTS dùng index idx_spam_leads_norm.
     // Username thật → platform 'telegram' (automation gửi tin được).
     const insertUsernameLeadStmt = db.prepare(`
-      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
-      VALUES (?, 'telegram', 'username', ?, ?, ?, 'pending', ?)
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source, normalized_value)
+      SELECT ?, 'telegram', 'username', ?, ?, ?, 'pending', ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM spam_leads WHERE workspace_id = ? AND normalized_value = ?
+      )
     `);
     // Không username → platform 'telegram_name': export/CSV được nhưng KHÔNG bị
     // automation nhắm tới (campaign lọc platform='telegram') → không gửi nhầm người.
     const insertNameOnlyLeadStmt = db.prepare(`
-      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
-      VALUES (?, 'telegram_name', 'member_name', ?, ?, ?, 'pending', ?)
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source, normalized_value)
+      SELECT ?, 'telegram_name', 'member_name', ?, ?, ?, 'pending', ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM spam_leads WHERE workspace_id = ? AND normalized_value = ?
+      )
     `);
     const insertPhoneLeadStmt = db.prepare(`
-      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
-      VALUES (?, 'zalo', 'phone', ?, ?, NULL, 'pending', ?)
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source, normalized_value)
+      SELECT ?, 'zalo', 'phone', ?, ?, NULL, 'pending', ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM spam_leads WHERE workspace_id = ? AND normalized_value = ?
+      )
     `);
 
     interface TgMember {
@@ -128,13 +140,15 @@ export async function runTelegramScrapeJob(options: TelegramScrapeOptions): Prom
           if (username) {
             insertLeadStmt.run(jobId, workspaceId, 'telegram', username, displayName, m.avatarUrl || null, `https://t.me/${username}`, m.leadType || 'member', null);
             if (autoImport) {
-              insertUsernameLeadStmt.run(workspaceId, `@${username}`, displayName, m.avatarUrl || null, targetTag);
+              const unameNorm = normalizeLeadValue('telegram', username);
+              insertUsernameLeadStmt.run(workspaceId, `@${username}`, displayName, m.avatarUrl || null, targetTag, unameNorm, workspaceId, unameNorm);
             }
           } else {
             // key 'n:' + tên — lưu vào cột uid để UNIQUE(job_id, uid) dedup đúng
             insertLeadStmt.run(jobId, workspaceId, 'telegram_name', key, displayName, m.avatarUrl || null, null, m.leadType || 'member_name', null);
             if (autoImport) {
-              insertNameOnlyLeadStmt.run(workspaceId, displayName, displayName, m.avatarUrl || null, targetTag);
+              const nameNorm = normalizeLeadValue('telegram_name', displayName);
+              insertNameOnlyLeadStmt.run(workspaceId, displayName, displayName, m.avatarUrl || null, targetTag, nameNorm, workspaceId, nameNorm);
             }
             nameOnlyCount++;
           }
@@ -163,7 +177,8 @@ export async function runTelegramScrapeJob(options: TelegramScrapeOptions): Prom
           phoneCount++;
           inserted++;
           if (autoImport) {
-            insertPhoneLeadStmt.run(workspaceId, phone, `Khách hàng ${phone} (Telegram)`, `${targetTag}_SĐT`);
+            const phoneNorm = normalizeLeadValue('zalo', phone);
+            insertPhoneLeadStmt.run(workspaceId, phone, `Khách hàng ${phone} (Telegram)`, `${targetTag}_SĐT`, phoneNorm, workspaceId, phoneNorm);
           }
         }
       });

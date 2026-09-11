@@ -85,6 +85,11 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
   const [success, setSuccess] = useState('');
   const [selectedPlatform, setSelectedPlatform] = useState<'telegram' | 'facebook' | 'messenger'>('facebook');
   const [internalAccounts, setInternalAccounts] = useState<Account[]>([]);
+  // P4 — hàng đợi mục tiêu chạy nền (qua đêm)
+  const [queueState, setQueueState] = useState<{ status: string; totalDue: number; processed: number; scraped: number; lastMessage: string | null } | null>(null);
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [queueHours, setQueueHours] = useState(8);
+  const [queueIntervalHours, setQueueIntervalHours] = useState(6);
 
   const fetchAccounts = async () => {
     const data = await safeFetchJson('/api/accounts');
@@ -109,10 +114,44 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
     }
   };
 
+  const fetchQueueState = async () => {
+    const data = await safeFetchJson('/api/spam/scrape-queue');
+    if (data.success) setQueueState(data.data);
+  };
+
+  const controlQueue = async (action: 'start' | 'stop') => {
+    setQueueBusy(true);
+    setError('');
+    try {
+      const data = await safeFetchJson('/api/spam/scrape-queue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          maxRuntimeHours: queueHours,
+          minIntervalHours: queueIntervalHours,
+          parallelSessions,
+          accountIds: selectedAccountIds,
+        }),
+      });
+      if (data.success) {
+        setSuccess(data.message || (action === 'start' ? 'Đã bắt đầu hàng đợi mục tiêu.' : 'Đã dừng hàng đợi.'));
+        setQueueState(data.data);
+      } else {
+        setError(data.error || 'Không điều khiển được hàng đợi.');
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Lỗi kết nối máy chủ.');
+    } finally {
+      setQueueBusy(false);
+    }
+  };
+
   useEffect(() => {
     if (isOpen) {
       fetchJobs();
       fetchAccounts();
+      fetchQueueState();
     }
   }, [isOpen]);
 
@@ -151,10 +190,12 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
   useEffect(() => {
     let interval: NodeJS.Timeout;
     const hasActiveJob = jobs.some(j => j.status === 'pending' || j.status === 'processing');
+    const queueActive = queueState?.status === 'running';
     
-    if (isOpen && hasActiveJob) {
+    if (isOpen && (hasActiveJob || queueActive)) {
       interval = setInterval(() => {
         fetchJobs();
+        fetchQueueState();
         onSuccess();
       }, 4000);
     }
@@ -162,7 +203,7 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [isOpen, jobs]);
+  }, [isOpen, jobs, queueState?.status]);
 
   useEffect(() => {
     const fetchLeads = async () => {
@@ -740,6 +781,100 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
                       ? <>Pool chạy tối đa {Math.min(parallelSessions, Math.max(1, selectedAccountIds.length))} account đồng thời — mỗi account quét một phần bucket tên thành viên (a-z, 0-9, ký tự tiếng Việt). Tăng khi có nhiều account Telegram Live.</>
                       : <>Pool chạy tối đa {Math.min(parallelSessions, Math.max(1, selectedAccountIds.length))} account đồng thời (~{Math.min(parallelSessions, Math.max(1, selectedAccountIds.length)) * 300}–{Math.min(parallelSessions, Math.max(1, selectedAccountIds.length)) * 575} leads/giờ). Tăng khi có nhiều proxy rảnh; máy yếu (RAM &lt; 16GB) nên giữ ≤3.</>}
                   </div>
+                </div>
+
+                {/* P4 — Hàng đợi mục tiêu chạy nền (qua đêm) */}
+                <div style={{
+                  backgroundColor: 'rgba(168, 85, 247, 0.07)',
+                  border: '1px solid rgba(168, 85, 247, 0.28)',
+                  borderRadius: '8px',
+                  padding: '0.85rem 1rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.6rem'
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={{ fontSize: '0.85rem', fontWeight: 700, color: '#c084fc' }}>
+                        🌙 Hàng đợi mục tiêu chạy nền (qua đêm)
+                      </div>
+                      <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.15rem', lineHeight: 1.35 }}>
+                        Tự lấy lần lượt mục tiêu trong <strong>📡 Nguồn Theo dõi</strong> (target Facebook/Telegram đang bật), cào xong nghỉ rồi sang mục tiêu kế — tôn trọng cooldown account, tự tạm dừng khi hết account.
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      {queueState?.status === 'running' ? (
+                        <button
+                          type="button"
+                          className="btn btn-danger"
+                          style={{ fontSize: '0.78rem', padding: '0.4rem 1rem' }}
+                          disabled={queueBusy}
+                          onClick={() => controlQueue('stop')}
+                        >
+                          ⏹ Dừng hàng đợi
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          style={{ fontSize: '0.78rem', padding: '0.4rem 1rem', backgroundColor: '#7c3aed', borderColor: '#7c3aed' }}
+                          disabled={queueBusy}
+                          onClick={() => controlQueue('start')}
+                        >
+                          ▶ Chạy hàng đợi
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                      Trần thời gian:
+                      <input
+                        type="number"
+                        min={0}
+                        max={48}
+                        value={queueHours}
+                        onChange={(e) => setQueueHours(parseInt(e.target.value, 10) || 0)}
+                        style={{ width: '3.4rem', fontSize: '0.75rem', padding: '0.15rem 0.35rem' }}
+                        className="form-input"
+                      />
+                      giờ {queueHours === 0 ? '(không giới hạn)' : ''}
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                      Nghỉ giữa 2 lần cào cùng mục tiêu:
+                      <input
+                        type="number"
+                        min={0}
+                        max={168}
+                        value={queueIntervalHours}
+                        onChange={(e) => setQueueIntervalHours(parseInt(e.target.value, 10) || 0)}
+                        style={{ width: '3.4rem', fontSize: '0.75rem', padding: '0.15rem 0.35rem' }}
+                        className="form-input"
+                      />
+                      giờ
+                    </label>
+                  </div>
+
+                  {queueState && queueState.status !== 'idle' && (
+                    <div style={{
+                      fontSize: '0.74rem',
+                      padding: '0.4rem 0.6rem',
+                      borderRadius: '6px',
+                      backgroundColor: queueState.status === 'running' ? 'rgba(74, 222, 128, 0.1)' : 'rgba(255,255,255,0.04)',
+                      color: queueState.status === 'running' ? '#4ade80' : 'var(--text-secondary)'
+                    }}>
+                      <strong>
+                        {queueState.status === 'running' ? '⏳ Đang chạy' :
+                         queueState.status === 'paused' ? '⏸ Tạm dừng' :
+                         queueState.status === 'completed' ? '✅ Hoàn tất' :
+                         queueState.status === 'stopped' ? '⏹ Đã dừng' :
+                         queueState.status === 'failed' ? '⚠️ Lỗi' : queueState.status}
+                      </strong>
+                      {' · '}Đã xử lý {queueState.processed}/{queueState.totalDue} mục tiêu, thu {queueState.scraped} lead
+                      {queueState.lastMessage ? <> — {queueState.lastMessage}</> : null}
+                    </div>
+                  )}
                 </div>
 
                 {/* Live Account & Scraping Speed Estimator Widget */}

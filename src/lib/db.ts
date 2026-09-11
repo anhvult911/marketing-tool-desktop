@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { DB_PATH } from './paths';
+import { normalizeLeadValue } from './lead-normalize';
 
 const dbPath = DB_PATH;
 console.log(`[Database] 📁 SQLite Local Database active: ${dbPath}`);
@@ -134,6 +135,7 @@ export function initDatabaseSchema() {
       platform TEXT NOT NULL,
       lead_type TEXT NOT NULL DEFAULT 'uid',
       value TEXT NOT NULL UNIQUE,
+      normalized_value TEXT,
       display_name TEXT,
       avatar_url TEXT,
       status TEXT DEFAULT 'pending',
@@ -267,6 +269,33 @@ export function initDatabaseSchema() {
     }
     if (!spamColNames.includes('avatar_url')) {
       db.exec(`ALTER TABLE spam_leads ADD COLUMN avatar_url TEXT`);
+    }
+    // P4 — cột khoá chuẩn hoá cho dedup đa biến thể (@User vs t.me/user,
+    // 090… vs +8490…). Backfill theo lô để không khoá DB lớn lâu.
+    if (!spamColNames.includes('normalized_value')) {
+      db.exec(`ALTER TABLE spam_leads ADD COLUMN normalized_value TEXT`);
+    }
+    {
+      const pendingBackfill = db.prepare(`
+        SELECT id, platform, value FROM spam_leads
+        WHERE normalized_value IS NULL AND value IS NOT NULL AND value != ''
+        LIMIT 1000
+      `);
+      const updateNorm = db.prepare(`UPDATE spam_leads SET normalized_value = ? WHERE id = ?`);
+      let guard = 0;
+      while (guard < 500) { // trần 500 lô = 500k lead mỗi lần khởi động
+        const rows = pendingBackfill.all() as Array<{ id: number; platform: string; value: string }>;
+        if (rows.length === 0) break;
+        const tx = db.transaction(() => {
+          for (const r of rows) {
+            updateNorm.run(normalizeLeadValue(r.platform, r.value), r.id);
+          }
+        });
+        tx();
+        if (rows.length < 1000) break;
+        guard++;
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_spam_leads_norm ON spam_leads(workspace_id, normalized_value)`);
     }
 
     const targetsInfo = db.prepare(`PRAGMA table_info(scrape_targets)`).all() as any[];

@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import db, { getSetting } from './db';
 import { extractVietnamesePhones, minePhonesFromHtml } from './lead-utils';
+import { normalizeLeadValue } from './lead-normalize';
 import { scrapeLimiter, ConcurrencyLimiter } from './concurrency';
 import { ScrapeAccountPool } from './scrape-pool';
 import { ScrapeTaskBoard } from './scrape-tasks';
@@ -2312,14 +2313,23 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    // P4 — chèn kèm khoá chuẩn hoá + chặn trùng ngữ nghĩa ngay ở tầng SQL
+    // (@User vs t.me/user, 090… vs +8490…). WHERE NOT EXISTS dùng index
+    // idx_spam_leads_norm nên vẫn rẻ; INSERT OR IGNORE giữ dedup tuyệt đối theo value.
     const insertSpamLeadStmt = db.prepare(`
-      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
-      VALUES (?, 'facebook', 'uid', ?, ?, ?, 'pending', ?)
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source, normalized_value)
+      SELECT ?, 'facebook', 'uid', ?, ?, ?, 'pending', ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM spam_leads WHERE workspace_id = ? AND normalized_value = ?
+      )
     `);
 
     const insertPhoneLeadStmt = db.prepare(`
-      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source)
-      VALUES (?, 'zalo', 'phone', ?, ?, NULL, 'pending', ?)
+      INSERT OR IGNORE INTO spam_leads (workspace_id, platform, lead_type, value, display_name, avatar_url, status, source, normalized_value)
+      SELECT ?, 'zalo', 'phone', ?, ?, NULL, 'pending', ?, ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM spam_leads WHERE workspace_id = ? AND normalized_value = ?
+      )
     `);
 
     // B3: multi-target — mỗi dòng 1 target, dedup chung qua collectedUids
@@ -2340,11 +2350,15 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
             if (!collectedPhones.has(lead.phone)) {
               collectedPhones.add(lead.phone);
               if (autoImport) {
+                const phoneNorm = normalizeLeadValue('zalo', lead.phone);
                 insertPhoneLeadStmt.run(
                   workspaceId,
                   lead.phone,
                   lead.displayName || `Khách hàng ${lead.phone}`,
-                  `${targetTag}_SĐT`
+                  `${targetTag}_SĐT`,
+                  phoneNorm,
+                  workspaceId,
+                  phoneNorm
                 );
                 phoneCount++;
                 inserted++;
@@ -2389,12 +2403,16 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           );
 
           if (autoImport) {
+            const uidNorm = normalizeLeadValue('facebook', lead.uid);
             insertSpamLeadStmt.run(
               workspaceId,
               lead.uid,
               lead.displayName || lead.uid,
               lead.avatarUrl || null,
-              targetTag
+              targetTag,
+              uidNorm,
+              workspaceId,
+              uidNorm
             );
           }
 
@@ -2404,11 +2422,15 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
             collectedPhones.add(lead.phone);
             phoneCount++;
             if (autoImport) {
+              const phoneNorm = normalizeLeadValue('zalo', lead.phone);
               insertPhoneLeadStmt.run(
                 workspaceId,
                 lead.phone,
                 lead.displayName || `Khách hàng ${lead.phone}`,
-                `${targetTag}_SĐT`
+                `${targetTag}_SĐT`,
+                phoneNorm,
+                workspaceId,
+                phoneNorm
               );
             }
           }

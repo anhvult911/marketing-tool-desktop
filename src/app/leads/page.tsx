@@ -52,7 +52,9 @@ async function safeFetchJson(url: string, options?: RequestInit) {
 }
 
 export default function LeadsPage() {
-  const [leads, setLeads] = useState<Lead[]>([]);
+  // P4 — không tải toàn bộ lead về client nữa: server trả collections + stats,
+  // chi tiết từng tập do LeadDetailDrawer tự phân trang khi mở.
+  const [collections, setCollections] = useState<LeadCollection[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [campaigns, setCampaigns] = useState<any[]>([]);
   const [leadsStats, setLeadsStats] = useState({
@@ -76,9 +78,10 @@ export default function LeadsPage() {
   const [selectedCollectionName, setSelectedCollectionName] = useState<string | null>(null);
 
   const fetchLeads = async () => {
-    const data = await safeFetchJson('/api/spam/leads');
+    // pageSize=1: chỉ cần stats + collections (tổng hợp bằng SQL), không cần rows
+    const data = await safeFetchJson('/api/spam/leads?pageSize=1');
     if (data.success) {
-      setLeads(data.data || []);
+      setCollections(Array.isArray(data.collections) ? data.collections : []);
       if (data.stats) setLeadsStats(data.stats);
     }
   };
@@ -118,42 +121,14 @@ export default function LeadsPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Group leads into Collections / Tập Leads (Memoized to prevent lag during searching/scrolling)
-  const collectionsList = useMemo(() => {
-    const collectionsMap = new Map<string, LeadCollection>();
-    leads.forEach(l => {
-      const colName = l.source && l.source.trim() ? l.source.trim() : 'Danh_Sach_Thủ_Công';
-      if (!collectionsMap.has(colName)) {
-        collectionsMap.set(colName, {
-          name: colName,
-          total: 0,
-          pending: 0,
-          sent: 0,
-          failed: 0,
-          platforms: [],
-          lastUpdated: l.created_at
-        });
-      }
-      const col = collectionsMap.get(colName)!;
-      col.total += 1;
-      if (l.status === 'pending') col.pending += 1;
-      else if (l.status === 'sent') col.sent += 1;
-      else if (l.status === 'failed') col.failed += 1;
-      if (l.platform && !col.platforms.includes(l.platform)) {
-        col.platforms.push(l.platform);
-      }
-    });
-    return Array.from(collectionsMap.values());
-  }, [leads]);
-
   const filteredCollections = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
-    return collectionsList.filter(col => {
+    return collections.filter(col => {
       const matchesSearch = !q || col.name.toLowerCase().includes(q);
       const matchesPlatform = selectedPlatformFilter === 'all' || col.platforms.includes(selectedPlatformFilter);
       return matchesSearch && matchesPlatform;
     });
-  }, [collectionsList, searchQuery, selectedPlatformFilter]);
+  }, [collections, searchQuery, selectedPlatformFilter]);
 
   const handleDeleteLead = async (id: number) => {
     try {
@@ -196,14 +171,13 @@ export default function LeadsPage() {
   };
 
   const handleResetCollection = async (collectionName: string) => {
-    const targetIds = leads.filter(l => (l.source || 'Danh_Sach_Thủ_Công') === collectionName).map(l => l.id);
-    if (targetIds.length === 0) return;
     setLoading(true);
     try {
+      // Reset theo NGUỒN ở server — không cần tải hết id của tập về client
       const data = await safeFetchJson('/api/spam/leads', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ all: false, ids: targetIds })
+        body: JSON.stringify({ source: collectionName })
       });
       if (data.success) {
         setMessage({ text: `Đã đặt lại trạng thái Tập Leads "${collectionName}" về "SẴN SÀNG".`, type: 'success' });
@@ -216,10 +190,17 @@ export default function LeadsPage() {
     }
   };
 
-  const handleExportCollectionCSV = (collectionName: string) => {
-    const colLeads = leads.filter(l => (l.source || 'Danh_Sach_Thủ_Công') === collectionName);
+  const handleExportCollectionCSV = async (collectionName: string) => {
+    // Tải cả tập theo trang (5000/trang) rồi xuất CSV — server-side pagination
+    const colLeads: Lead[] = [];
+    for (let page = 1; page <= 20; page++) {
+      const data = await safeFetchJson(`/api/spam/leads?source=${encodeURIComponent(collectionName)}&page=${page}&pageSize=5000`);
+      if (!data.success || !Array.isArray(data.data) || data.data.length === 0) break;
+      colLeads.push(...data.data);
+      if (data.data.length < 5000) break;
+    }
     if (colLeads.length === 0) return;
-    
+
     let csvContent = 'data:text/csv;charset=utf-8,ID,Platform,Value,Source,Status\n';
     colLeads.forEach(l => {
       csvContent += `${l.id},"${l.platform}","${l.value}","${l.source || ''}","${l.status}"\n`;
@@ -286,23 +267,23 @@ export default function LeadsPage() {
           <span className="stat-label">Tổng Leads</span>
         </div>
         <div className="stat-card">
-          <span className="stat-value">{collectionsList.length}</span>
+          <span className="stat-value">{collections.length}</span>
           <span className="stat-label">Tập Leads / Collections</span>
         </div>
         <div className="stat-card">
-          <span className="stat-value">{leads.filter(l => l.platform === 'facebook').length}</span>
+          <span className="stat-value">{leadsStats.social}</span>
           <span className="stat-label">Facebook</span>
         </div>
         <div className="stat-card">
-          <span className="stat-value">{leads.filter(l => l.platform === 'telegram').length}</span>
+          <span className="stat-value">{leadsStats.telegram}</span>
           <span className="stat-label">Telegram</span>
         </div>
         <div className="stat-card">
-          <span className="stat-value">{leads.filter(l => l.platform === 'zalo').length}</span>
+          <span className="stat-value">{leadsStats.zalo}</span>
           <span className="stat-label">Zalo</span>
         </div>
         <div className="stat-card" style={{ borderLeft: '3px solid var(--color-success)' }}>
-          <span className="stat-value" style={{ color: 'var(--color-success)' }}>{leads.filter(l => l.status === 'pending').length}</span>
+          <span className="stat-value" style={{ color: 'var(--color-success)' }}>{leadsStats.pending}</span>
           <span className="stat-label">Sẵn sàng</span>
         </div>
       </div>
@@ -334,7 +315,7 @@ export default function LeadsPage() {
         </div>
 
         <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-          Hiển thị <strong>{filteredCollections.length}</strong> / <strong>{collectionsList.length}</strong> Tập Leads
+          Hiển thị <strong>{filteredCollections.length}</strong> / <strong>{collections.length}</strong> Tập Leads
         </span>
       </div>
 
@@ -464,7 +445,7 @@ export default function LeadsPage() {
           isOpen={!!selectedCollectionName}
           onClose={() => setSelectedCollectionName(null)}
           collectionName={selectedCollectionName}
-          leads={leads}
+          collectionTotal={collections.find(c => c.name === selectedCollectionName)?.total}
           onRefresh={fetchLeads}
           onResetLeads={async (all, ids) => {
             await safeFetchJson('/api/spam/leads', {
@@ -477,6 +458,7 @@ export default function LeadsPage() {
           onDeleteLead={async (id) => {
             await handleDeleteLead(id);
           }}
+          onResetCollection={async (source) => { await handleResetCollection(source); }}
           onClearAllLeads={async () => {
             await handleDeleteCollection(selectedCollectionName);
             setSelectedCollectionName(null);

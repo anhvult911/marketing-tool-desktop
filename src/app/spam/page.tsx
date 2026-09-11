@@ -301,7 +301,9 @@ export default function SpamPage() {
 
   const fetchLeads = async () => {
     try {
-      const res = await fetch('/api/spam/leads');
+      // P4 — chỉ tải lead SẴN SÀNG (pending): wizard chiến dịch chỉ thao tác trên
+      // tập này; trước đây tải tối đa 10k lead bất kể trạng thái gây payload lớn.
+      const res = await fetch('/api/spam/leads?status=pending&pageSize=5000');
       const data = await res.json();
       if (data.success) {
         setLeads(data.data);

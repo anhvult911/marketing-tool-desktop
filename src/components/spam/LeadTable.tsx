@@ -31,6 +31,11 @@ interface LeadTableProps {
   setLeadPage: React.Dispatch<React.SetStateAction<number>>;
   onExportCSV?: () => void;
   tableMaxHeight?: string;
+  /** P4 — server mode: `leads` đã là 1 trang; tổng số do server trả về. */
+  serverTotal?: number;
+  /** Server mode: page size do parent sở hữu (phải khớp query gửi lên server). */
+  serverPageSize?: number;
+  onPageSizeChange?: (size: number) => void;
 }
 
 export function detectLeadCategory(lead: Lead) {
@@ -88,9 +93,16 @@ export default function LeadTable({
   leadPage,
   setLeadPage,
   onExportCSV,
-  tableMaxHeight
+  tableMaxHeight,
+  serverTotal,
+  serverPageSize,
+  onPageSizeChange
 }: LeadTableProps) {
   const [pageSize, setPageSize] = React.useState<number>(15);
+
+  const serverMode = typeof serverTotal === 'number';
+  // Server mode: page size khớp query của parent (lệch nhau → phân trang sai)
+  const effectivePageSize = serverMode ? (serverPageSize ?? pageSize) : pageSize;
 
   const filteredLeads = selectedSourceFilter
     ? leads.filter(l => l.source === selectedSourceFilter)
@@ -105,15 +117,19 @@ export default function LeadTable({
     );
   });
 
-  const totalPages = Math.max(1, Math.ceil(searchedLeads.length / pageSize));
-  const paginatedLeads = searchedLeads.slice(leadPage * pageSize, (leadPage + 1) * pageSize);
+  // Server mode: dữ liệu đã lọc/phân trang ở server — không cắt lại client-side
+  // (cắt lại sẽ ra trang rỗng khi server trả page 2+ với pageSize khác).
+  const visibleLeads = serverMode ? leads : searchedLeads;
+  const totalCount = serverMode ? (serverTotal as number) : searchedLeads.length;
+  const totalPages = Math.max(1, Math.ceil(totalCount / effectivePageSize));
+  const paginatedLeads = serverMode ? leads : searchedLeads.slice(leadPage * effectivePageSize, (leadPage + 1) * effectivePageSize);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', height: '100%', minHeight: 0 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1rem', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
           <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
-            Danh sách Leads ({searchedLeads.length})
+            Danh sách Leads ({totalCount})
           </span>
           
           {selectedLeadIds.size > 0 && (
@@ -136,16 +152,16 @@ export default function LeadTable({
           />
 
           {/* Bulk Select Actions */}
-          {searchedLeads.filter(l => l.status === 'pending').length > 0 && (
+          {visibleLeads.filter(l => l.status === 'pending').length > 0 && (
             <div style={{ display: 'flex', gap: '0.35rem' }}>
               <button
                 type="button"
-                onClick={() => onSelectAllFiltered(searchedLeads)}
+                onClick={() => onSelectAllFiltered(visibleLeads)}
                 className="btn btn-secondary"
                 style={{ fontSize: '0.65rem', padding: '0.2rem 0.5rem', height: 'auto', border: '1px solid var(--border-color)', background: 'rgba(255, 255, 255, 0.05)', color: 'var(--text-secondary)', cursor: 'pointer' }}
                 title="Chọn tất cả các mục tiêu đang hiển thị và ở trạng thái Sẵn sàng"
               >
-                ☑️ Chọn tất cả ({searchedLeads.filter(l => l.status === 'pending').length})
+                ☑️ Chọn tất cả ({visibleLeads.filter(l => l.status === 'pending').length})
               </button>
               <button
                 type="button"
@@ -213,7 +229,7 @@ export default function LeadTable({
         </div>
       </div>
 
-      {searchedLeads.length === 0 ? (
+      {visibleLeads.length === 0 ? (
         <div style={{ padding: '2rem', border: '1px solid var(--border-color)', borderRadius: '6px', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
           {leadSearch || selectedSourceFilter ? 'Không tìm thấy Leads nào khớp với bộ lọc.' : 'Chưa có leads nào. Vui lòng nạp dữ liệu để tiếp tục.'}
         </div>
@@ -438,16 +454,18 @@ export default function LeadTable({
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 'auto', paddingTop: '0.75rem', borderTop: '1px solid var(--border-color)', flexWrap: 'wrap', gap: '0.5rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
               <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
-                Trang {leadPage + 1} / {totalPages} (Hiển thị {paginatedLeads.length} của {searchedLeads.length} mục tiêu)
+                Trang {leadPage + 1} / {totalPages} (Hiển thị {paginatedLeads.length} của {totalCount} mục tiêu)
               </span>
 
               {/* Dynamic Page Size Selector */}
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
                 <span>| Xem:</span>
                 <select
-                  value={pageSize}
+                  value={effectivePageSize}
                   onChange={(e) => {
-                    setPageSize(Number(e.target.value));
+                    const n = Number(e.target.value);
+                    if (serverMode) onPageSizeChange?.(n);
+                    else setPageSize(n);
                     setLeadPage(0);
                   }}
                   style={{ fontSize: '0.75rem', padding: '0.15rem 0.35rem', borderRadius: '4px', background: 'var(--bg-primary)', border: '1px solid var(--border-color)', color: 'var(--text-primary)' }}
