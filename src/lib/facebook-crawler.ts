@@ -1590,7 +1590,7 @@ async function scrapeMbasicReactionsForPost(
       if (page.isClosed()) break;
       if (requestBudget && requestBudget.remaining <= 0) return addedCount;
       requestCount++;
-      if (requestBudget) requestBudget.remaining--;
+      spendBudget(requestBudget);
 
       try {
         const sizeBefore = addedCount;
@@ -1664,7 +1664,7 @@ async function scrapeMbasicCommentersForPost(
   while (currentUrl && addedCount < maxLeads && pageNum <= 40 && stagnantPages < 3) {
     if (page.isClosed()) break;
     if (requestBudget && requestBudget.remaining <= 0) break;
-    if (requestBudget) requestBudget.remaining--;
+    spendBudget(requestBudget);
 
     try {
       const sizeBefore = addedCount;
@@ -1730,7 +1730,7 @@ async function discoverMbasicPostIds(
     if (page.isClosed()) break;
     if (requestBudget && requestBudget.remaining <= 0) break;
     try {
-      if (requestBudget) requestBudget.remaining--;
+      spendBudget(requestBudget);
       await page.goto(timelineUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
       const html = await page.content().catch(() => '');
 
@@ -1781,18 +1781,74 @@ async function discoverMbasicPostIds(
 }
 
 /**
+ * Tiêu 1 request trong ngân sách phiên: giảm `remaining` VÀ báo `onSpend` để
+ * telemetry + daily_request_count ghi nhận. Các engine mbasic trước đây chỉ
+ * giảm `remaining` nên telemetry luôn báo 0 request và quota ngày bị bỏ sót.
+ */
+function spendBudget(
+  budget: { remaining: number; onSpend?: () => void } | null,
+  n = 1
+): void {
+  if (!budget) return;
+  budget.remaining -= n;
+  if (budget.onSpend) {
+    for (let i = 0; i < n; i++) budget.onSpend();
+  }
+}
+
+/**
  * Cào thành viên nhóm qua mbasic.facebook.com (miễn nhiễm GraphQL throttle & React Virtual DOM).
  * P2 — nhận `startUrl` để RESUME phân trang từ chain trước (account khác tiếp tục
  * đúng trang thay vì quét lại từ đầu — tránh đốt request vào member đã thu).
  */
-async function scrapeGroupMembersViaMbasic(
+export type GroupStopReason =
+  | 'exhausted'   // đi hết phân trang
+  | 'empty'       // nhiều trang liền không thấy thành viên nào
+  | 'blocked'     // FB trả login/checkpoint wall
+  | 'not_member'  // account không thuộc nhóm → FB chỉ hiện nút tham gia
+  | 'quota'       // chạm trần lead phiên (còn trang, chạy tiếp được)
+  | 'budget'      // hết ngân sách request (còn trang, chạy tiếp được)
+  | 'error'       // lỗi phiên/trang đóng
+  | 'cancelled';
+
+export interface GroupHarvestResult {
+  added: number;
+  /** URL chạy tiếp — CHỈ có khi thực sự còn việc (phân trang thật / hết ngân sách) */
+  nextUrl: string | null;
+  stopReason: GroupStopReason;
+  /** dấu hiệu nhận dạng trang để chẩn đoán từ xa (login_form, join, cp…) */
+  markers: string[];
+}
+
+/**
+ * Nhận dạng "tường" FB trả về thay vì danh sách thành viên. Trước đây harvester
+ * coi mọi lần dừng sớm là "còn trang kế" → job #48 lưu cursor vào URL bị chặn,
+ * kênh group không bao giờ đóng và account bị checkpoint vì đập lại nhiều lần.
+ */
+function detectGroupPageWall(html: string): { blocked: boolean; notMember: boolean; markers: string[] } {
+  const lower = html.toLowerCase();
+  const markers: string[] = [];
+  const blocked = lower.includes('login_form') || lower.includes('checkpoint') ||
+    lower.includes('temporarily blocked') || lower.includes('disabled');
+  if (lower.includes('login_form')) markers.push('login_form');
+  if (lower.includes('checkpoint')) markers.push('checkpoint');
+  const joinSignals = [
+    'tham gia nhóm', 'join group', 'join this group', 'bạn cần là thành viên',
+    'you must be a member', 'phải là thành viên', 'request to join', 'yêu cầu tham gia',
+  ].filter(k => lower.includes(k));
+  if (joinSignals.length > 0) markers.push('join:' + joinSignals[0]);
+  return { blocked, notMember: joinSignals.length > 0, markers };
+}
+
+export async function scrapeGroupMembersViaMbasic(
   page: Page,
   targetGroup: string,
   maxLeads: number,
   saveBatch: (leads: ExtractedLead[]) => number,
   requestBudget: { remaining: number; onSpend?: () => void } | null = null,
-  startUrl?: string | null
-): Promise<{ added: number; nextUrl: string | null }> {
+  startUrl?: string | null,
+  cancelSignal?: { cancelled: boolean }
+): Promise<GroupHarvestResult> {
   console.log(`[Mbasic Group Harvester] 🚀 Khởi động bộ cào mbasic cho ${targetGroup}${startUrl ? ' (resume từ trang đã lưu)' : ''}...`);
 
   const targetClean = targetGroup.trim().replace(/\/$/, '');
@@ -1817,6 +1873,9 @@ async function scrapeGroupMembersViaMbasic(
   let pageNum = 1;
   let addedCount = 0;
   let consecutiveEmptyPages = 0;
+  // Lý do dừng tường minh — KHÔNG suy diễn từ currentUrl (bug job #48)
+  let stopReason: GroupStopReason | null = null;
+  const markers: string[] = [];
 
   const skipKeywords = [
     'groups', 'messages', 'notifications', 'friends', 'marketplace', 'watch',
@@ -1832,21 +1891,29 @@ async function scrapeGroupMembersViaMbasic(
     'đăng nhập', 'tin nhắn', 'thông báo', 'cài đặt', 'xem trước', 'tìm kiếm'
   ];
 
-  while (currentUrl && addedCount < maxLeads && pageNum <= 500 && consecutiveEmptyPages < 5) {
-    if (page.isClosed()) break;
-    if (requestBudget && requestBudget.remaining <= 0) break;
+  while (currentUrl && addedCount < maxLeads && pageNum <= 500 && consecutiveEmptyPages < 5 && !stopReason) {
+    if (page.isClosed()) { stopReason = 'error'; break; }
+    if (requestBudget && requestBudget.remaining <= 0) { stopReason = 'budget'; break; }
+    if (cancelSignal?.cancelled) { stopReason = 'cancelled'; break; }
     try {
       await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
       await page.waitForTimeout(1500 + Math.floor(Math.random() * 1000));
-      if (requestBudget) requestBudget.remaining--;
+      spendBudget(requestBudget);
       // Nghỉ sâu mỗi 10 trang — phân trang mbasic liên tục là tín hiệu automation
       if (pageNum % 10 === 0) {
         await page.waitForTimeout(8000 + Math.floor(Math.random() * 6000));
       }
 
       const html = await page.content().catch(() => '');
-      if (!html || html.includes('checkpoint') || html.includes('login_form')) {
-        console.warn(`[Mbasic Group Harvester] Yêu cầu đăng nhập / Checkpoint tại trang ${pageNum}`);
+      if (!html) {
+        stopReason = 'error';
+        break;
+      }
+      const wall = detectGroupPageWall(html);
+      markers.push(...wall.markers);
+      if (wall.blocked) {
+        console.warn(`[Mbasic Group Harvester] ⛔ FB trả tường chặn (${wall.markers.join(',') || 'cp/login'}) tại trang ${pageNum} — dừng, KHÔNG lưu cursor.`);
+        stopReason = 'blocked';
         break;
       }
 
@@ -1894,9 +1961,18 @@ async function scrapeGroupMembersViaMbasic(
       }
 
       // Đếm theo số lead insert MỚI (dedup ở saveBatch) — anchor lặp giữa các trang không đốt quota
-      addedCount += saveBatch(batch);
+      const savedNow = saveBatch(batch);
+      addedCount += savedNow;
       // P2 — SĐT trong bài đăng/bio hiển thị trên trang thành viên
       addedCount += harvestPhonesFromHtml(html, saveBatch);
+
+      // Trang đầu không có ai + có tín hiệu "tham gia nhóm" → account chưa vào nhóm.
+      // FB hiển thị nút join thay vì danh sách → không phải lỗi tạm thời.
+      if (pageNum === 1 && batch.length === 0 && wall.notMember) {
+        console.warn(`[Mbasic Group Harvester] ⛔ Account chưa tham gia nhóm (${wall.markers.join(',')}) — dừng.`);
+        stopReason = 'not_member';
+        break;
+      }
 
       const newFound = addedCount - sizeBefore;
       console.log(`[Mbasic Group Harvester] Trang ${pageNum}: +${newFound} leads (Tổng: ${addedCount}/${maxLeads})...`);
@@ -1934,8 +2010,25 @@ async function scrapeGroupMembersViaMbasic(
     }
   }
 
-  console.log(`[Mbasic Group Harvester] Hoàn tất! Đã thêm +${addedCount} leads qua mbasic (nextUrl: ${currentUrl ? 'có' : 'hết'}).`);
-  return { added: addedCount, nextUrl: currentUrl };
+  // ── Chốt lý do dừng khi vòng lặp tự thoát (không qua nhánh break) ──
+  if (!stopReason) {
+    if (addedCount >= maxLeads) stopReason = 'quota';
+    else if (consecutiveEmptyPages >= 5) stopReason = 'empty';
+    else if (pageNum > 500) stopReason = 'quota';
+    // Đi hết phân trang mà KHÔNG thu được ai → 'empty' (nhóm ẩn/rỗng), không phải
+    // 'exhausted' (đã cào xong) — khác biệt này quyết định thông báo cho người dùng.
+    else if (!currentUrl && addedCount === 0) stopReason = 'empty';
+    else if (!currentUrl) stopReason = 'exhausted';
+    else stopReason = 'error';
+  }
+
+  // Chỉ trả URL chạy tiếp khi THỰC SỰ còn việc: phân trang thật, hoặc dừng vì
+  // hạn mức (quota/budget) giữa danh sách. Mọi nhánh chặn/lỗi → null.
+  const resumable = stopReason === 'quota' || stopReason === 'budget';
+  const nextUrl = resumable ? currentUrl : null;
+
+  console.log(`[Mbasic Group Harvester] Hoàn tất: +${addedCount} leads, dừng vì ${stopReason}${nextUrl ? ' (còn trang kế)' : ''}.`);
+  return { added: addedCount, nextUrl, stopReason, markers: Array.from(new Set(markers)) };
 }
 /**
  * Trích xuất Post ID số trực tiếp từ URL mẫu fbid, story_fbid, /posts/ID, /reel/ID...
@@ -2312,6 +2405,10 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
 
     let scrapedCount = 0;
     let phoneCount = 0;
+    /** P4/fix: số ứng viên THÔ đã thấy trước dedup — phân biệt "trùng hết" vs "không thấy ai" */
+    let rawCandidates = 0;
+    /** Lý do kênh không thu được gì (chặn/không phải thành viên/nhóm rỗng) → error_msg cuối job */
+    const jobBlockReasons: string[] = [];
     const collectedUids = new Set<string>();
     const collectedPhones = new Set<string>();
 
@@ -2348,6 +2445,7 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     // Atomic qua transaction: an toàn khi nhiều account worker gọi đồng thời
     const saveLeadBatch = (leads: ExtractedLead[]): number => {
       if (leads.length === 0) return 0;
+      rawCandidates += leads.length;
       let inserted = 0;
       const tx = db.transaction(() => {
         for (const lead of leads) {
@@ -2576,6 +2674,17 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       }
     };
 
+    /** Ghi crawler_logs 1 lần cho mỗi (khoá) — tránh spam khi nhiều chain cùng lý do. */
+    const loggedBlockKeys = new Set<string>();
+    const logBlockReasonOnce = (key: string, targetValue: string, actionType: string, message: string): void => {
+      if (loggedBlockKeys.has(key)) return;
+      loggedBlockKeys.add(key);
+      try {
+        db.prepare(`INSERT INTO crawler_logs (workspace_id, target_value, action_type, message) VALUES (?, ?, ?, ?)`)
+          .run(workspaceId, targetValue, actionType, message);
+      } catch { /* log lỗi không được làm hỏng job */ }
+    };
+
     // ── Cursor chia sẻ theo target (followers GraphQL / trang thành viên nhóm) ──
     const cursorsByTarget: Array<string | null> = targetList.map(() => null);
     const resumeRow = db.prepare(`SELECT last_cursor, resume_target_idx FROM scrape_jobs WHERE id = ?`).get(jobId) as { last_cursor: string | null; resume_target_idx: number | null } | undefined;
@@ -2745,22 +2854,53 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
             if (viewerAccountId) {
               const mbasicPage = await newMbasicPage(browserContext);
               try {
-                const res = await scrapeGroupMembersViaMbasic(mbasicPage, currentTarget.cleanUrl, sessionQuota, saveLeadBatch, sessionRequestBudget, cursorsByTarget[targetIdx]);
+                const res = await scrapeGroupMembersViaMbasic(
+                  mbasicPage, currentTarget.cleanUrl, sessionQuota, saveLeadBatch,
+                  sessionRequestBudget, cursorsByTarget[targetIdx], cancelSignal
+                );
                 out.leads += res.added;
                 if (res.nextUrl) {
                   setCursorForTarget(targetIdx, res.nextUrl);
                 } else {
                   cursorsByTarget[targetIdx] = null;
-                  out.finished = true;
                 }
-                console.log(`[FB Scraper] Account #${accountId} mbasic group: +${res.added} leads (${res.nextUrl ? 'còn trang kế' : 'hết nhóm'}).`);
+                console.log(`[FB Scraper] Account #${accountId} mbasic group: +${res.added} leads (dừng: ${res.stopReason}${res.markers.length ? `, dấu hiệu: ${res.markers.join(',')}` : ''}).`);
+
+                // Phân loại theo PHẠM VI nguyên nhân trước khi đóng kênh:
+                //  - 'exhausted'/'empty': thuộc về TARGET (ai chạy cũng vậy) → đóng kênh.
+                //  - 'blocked'/'not_member': thuộc về ACCOUNT này → KHÔNG đóng kênh,
+                //    để account khác (đã vào nhóm / session sạch) thử tiếp. Account
+                //    hỏng tự bị loại bởi circuit breaker 2 chain 0 lead.
+                // Đóng kênh sai ở đây sẽ khiến nhóm không ai cào được chỉ vì 1 nick lỗi.
+                if (res.stopReason === 'exhausted' || res.stopReason === 'empty') {
+                  out.finished = true;
+                  board.markFinished(targetIdx, 'group');
+                }
+                if (res.stopReason === 'blocked') {
+                  const reason = `Nhóm ${currentTarget.identifier}: account @${accountUsername} nhận tường chặn từ FB (${res.markers.join(',') || 'login/checkpoint'}) — loại account này khỏi job, account khác thử tiếp.`;
+                  jobBlockReasons.push(reason);
+                  logBlockReasonOnce(`blocked:${targetIdx}:${accountId}`, currentTarget.identifier, 'group_blocked', reason);
+                  pool.markExhausted(accountId);
+                } else if (res.stopReason === 'not_member') {
+                  const reason = `Nhóm ${currentTarget.identifier}: account @${accountUsername} chưa tham gia nhóm nên FB không hiện danh sách thành viên — cần cho account vào nhóm rồi chạy lại.`;
+                  jobBlockReasons.push(reason);
+                  logBlockReasonOnce(`not_member:${targetIdx}:${accountId}`, currentTarget.identifier, 'group_not_member', reason);
+                } else if (res.stopReason === 'empty') {
+                  jobBlockReasons.push(`Nhóm ${currentTarget.identifier}: đi hết danh sách nhưng không thấy thành viên nào (nhóm ẩn/rỗng).`);
+                }
               } finally {
                 await mbasicPage.close().catch(() => {});
               }
             }
-            if (!cancelSignal.cancelled && remaining() > 0 && !groupDomDone[targetIdx]) {
+            if (!cancelSignal.cancelled && remaining() > 0 && !groupDomDone[targetIdx] && !out.finished) {
               groupDomDone[targetIdx] = true;
-              out.leads += await extractGroupMembersFromDOM(page, currentTarget.cleanUrl, saveLeadBatch, remaining(), cancelSignal);
+              const domLeads = await extractGroupMembersFromDOM(page, currentTarget.cleanUrl, saveLeadBatch, remaining(), cancelSignal);
+              out.leads += domLeads;
+              if (domLeads === 0) {
+                const reason = `Nhóm ${currentTarget.identifier}: DOM www cũng không đọc được thành viên nào bằng @${accountUsername} (account chưa vào nhóm, hoặc nhóm chặn xem thành viên).`;
+                jobBlockReasons.push(reason);
+                logBlockReasonOnce(`dom_empty:${targetIdx}`, currentTarget.identifier, 'group_dom_empty', reason);
+              }
             }
           } else if (task.channel === 'post') {
             // ── KÊNH POST: engagement DOM + reaction sâu + commenters ──
@@ -3039,18 +3179,25 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     }
 
     const actualTotal = (db.prepare(`SELECT count(*) as count FROM scraped_job_leads WHERE job_id = ?`).get(jobId) as { count: number } | undefined)?.count || scrapedCount;
-    // Pool chết toàn bộ (checkpoint/cookie die/0 lead mọi chain) ≠ completed —
-    // báo failed để UI không đánh lừa người dùng "job xong 0 leads".
+    // 0 lead LUÔN là failed kèm lý do cụ thể — "✓ COMPLETED 0" từng khiến job #48
+    // trông như thành công trong khi thực chất kênh bị chặn suốt phiên.
     const finalStatus = cancelSignal.cancelled
       ? 'stopped'
-      : actualTotal === 0 && !pool.isAlive()
+      : actualTotal === 0
         ? 'failed'
         : 'completed';
     if (finalStatus === 'failed') {
-      db.prepare(`UPDATE scrape_jobs SET error_msg = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
-        `Toàn bộ ${pool.exhaustedCount()} account trong pool bị loại (checkpoint / cookie die / 0 lead liên tiếp) — không thu được lead nào. Kiểm tra account, proxy rồi chạy lại.`,
-        jobId
-      );
+      let reason: string;
+      if (jobBlockReasons.length > 0) {
+        reason = Array.from(new Set(jobBlockReasons)).join(' ');
+      } else if (rawCandidates > 0) {
+        reason = `Đã thấy ${rawCandidates} ứng viên nhưng TẤT CẢ đều trùng lead đã có (INSERT bị dedup). Target có thể đã cào trước đó — dùng target khác hoặc xoá bớt lead cũ nếu muốn cào lại.`;
+      } else if (!pool.isAlive()) {
+        reason = `Toàn bộ ${pool.exhaustedCount()} account trong pool bị loại (checkpoint / cookie die / 0 lead liên tiếp) — không thu được lead nào. Kiểm tra account, proxy rồi chạy lại.`;
+      } else {
+        reason = 'Job kết thúc mà không thu được lead nào và không thấy ứng viên nào — kiểm tra lại target/quyền truy cập của account.';
+      }
+      db.prepare(`UPDATE scrape_jobs SET error_msg = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(reason, jobId);
     }
     db.prepare(`UPDATE scrape_jobs SET status = ?, total_count = ?, scraped_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
       finalStatus,
@@ -3060,9 +3207,10 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     );
     console.log(`[FB Scraper] Job #${jobId} finished! Total leads: ${actualTotal} (Phones: ${phoneCount}). Status: ${finalStatus}`);
     if (finalStatus === 'failed') {
+      const jobRow = db.prepare(`SELECT error_msg FROM scrape_jobs WHERE id = ?`).get(jobId) as { error_msg: string | null } | undefined;
       sendDesktopNotification(
-        'Cào dữ liệu Facebook thất bại ⚠️',
-        `Job #${jobId}: toàn bộ account bị loại trước khi thu được lead. Kiểm tra account/proxy rồi chạy lại.`
+        'Cào dữ liệu Facebook không thu được lead ⚠️',
+        (jobRow?.error_msg || `Job #${jobId} kết thúc với 0 lead.`).slice(0, 300)
       );
     } else {
       sendDesktopNotification(
