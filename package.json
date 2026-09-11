@@ -1,6 +1,6 @@
 {
   "name": "marketing-tool-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MKT Tools - Hệ thống Tự động hóa Marketing Đa kênh Desktop Edition",
   "main": "dist-electron/main.js",
   "author": "MKT Team",
