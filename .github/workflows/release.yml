@@ -1,5 +1,10 @@
 name: Build and Release Desktop App
 
+# Trigger: push tag v* (quy trình release chuẩn) hoặc chạy tay để build lại.
+# LƯU Ý: electron-builder lấy version + tag release từ `package.json`, KHÔNG từ tag
+# git. Vì vậy tag phải khớp version — bước "Verify" dưới đây chặn lệch âm thầm
+# (tag v1.0.1 nhưng package.json 1.0.0 sẽ publish đè lên release v1.0.0 cũ và
+# không máy nào nhận được cập nhật).
 on:
   push:
     tags:
@@ -24,8 +29,26 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
+          # Node 22: better-sqlite3 có prebuild sẵn → npm ci không phải biên dịch
+          # từ source (Node 20.20.2 trước đây rơi vào node-gyp và fail vì thiếu VS C++).
           node-version: 22
           cache: 'npm'
+
+      - name: Verify version matches tag
+        shell: bash
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "package.json version: $PKG_VERSION"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            echo "tag version: ${TAG_VERSION}"
+            if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} không khớp package.json version ${PKG_VERSION}. Hãy bump version trong package.json rồi tạo lại tag (electron-builder dùng version trong package.json để đặt tag release, nên lệch sẽ publish sai release và không ai nhận được update)."
+              exit 1
+            fi
+          else
+            echo "Không phải tag — sẽ publish vào release v${PKG_VERSION} (theo package.json)."
+          fi
 
       - name: Install dependencies
         run: npm ci
@@ -36,4 +59,56 @@ jobs:
       - name: Package and Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # releaseType=release nằm trong electron-builder.json: mặc định của
+        # electron-builder là DRAFT, mà electron-updater BỎ QUA draft hoàn toàn →
+        # app đã cài sẽ không bao giờ thấy bản mới.
         run: npx electron-builder --win --publish always
+
+      # Bắt buộc: electron-builder có thể "thành công" mà KHÔNG upload gì
+      # (từng xảy ra: "skipped publishing ... publishingType=draft") → CI xanh
+      # nhưng release trống. Bước này biến im lặng đó thành lỗi đỏ.
+      #
+      # Đồng thời kiểm tra TÊN FILE trong latest.yml phải khớp asset thật: đây
+      # chính là lỗi đang tồn tại ở release v1.0.0 (latest.yml ghi bản gạch ngang
+      # nhưng asset đặt tên dấu chấm → URL tải trả 404, auto-update hỏng câm).
+      - name: Verify release assets are actually published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "Kiểm tra release v${PKG_VERSION}..."
+          gh release view "v${PKG_VERSION}" --json isDraft,tagName,assets > release.json
+          gh release download "v${PKG_VERSION}" --pattern latest.yml --dir ./release-feed --clobber
+          node -e '
+            const fs = require("fs");
+            const yaml = require("js-yaml");
+            const r = JSON.parse(fs.readFileSync("release.json", "utf8"));
+            const names = r.assets.map(a => a.name);
+            console.log("tag:", r.tagName, "| draft:", r.isDraft);
+            console.log("assets:", names.join(", ") || "(trống)");
+
+            const problems = [];
+            if (r.isDraft) problems.push("release đang ở trạng thái DRAFT — electron-updater bỏ qua, không máy nào nhận được update");
+            if (!names.includes("latest.yml")) problems.push("thiếu latest.yml (feed cập nhật) — app không thể kiểm tra phiên bản");
+            if (!names.some(n => n.endsWith(".exe"))) problems.push("thiếu file cài đặt .exe");
+            if (!names.some(n => n.endsWith(".blockmap"))) problems.push("thiếu .blockmap (tải cập nhật từng phần)");
+
+            if (names.includes("latest.yml")) {
+              const feed = yaml.load(fs.readFileSync("release-feed/latest.yml", "utf8"));
+              const target = feed.path || (feed.files && feed.files[0] && feed.files[0].url);
+              console.log("latest.yml version:", feed.version, "| trỏ tới:", target);
+              if (feed.version !== r.tagName.replace(/^v/, "")) {
+                problems.push(`latest.yml version ${feed.version} KHÁC tag ${r.tagName} — app sẽ so sánh sai`);
+              }
+              if (!target || !names.includes(target)) {
+                problems.push(`latest.yml trỏ tới "${target}" nhưng asset đó KHÔNG tồn tại → URL tải sẽ 404, auto-update hỏng`);
+              }
+            }
+
+            if (problems.length > 0) {
+              for (const p of problems) console.error("::error::" + p);
+              process.exit(1);
+            }
+            console.log("OK: release publish đầy đủ và latest.yml khớp asset — auto-update hoạt động.");
+          '
