@@ -255,6 +255,14 @@ export function initDatabaseSchema() {
     if (!telemetryInfo.some(c => c.name === 'http_500')) {
       db.exec(`ALTER TABLE scrape_telemetry ADD COLUMN http_500 INTEGER DEFAULT 0`);
     }
+    // P5 — số liệu để auto-tune pacing: thời lượng phiên (tính leads/giờ) và
+    // request index của lần HTTP 500 đầu tiên (phát hiện pacing quá nhanh).
+    if (!telemetryInfo.some(c => c.name === 'duration_ms')) {
+      db.exec(`ALTER TABLE scrape_telemetry ADD COLUMN duration_ms INTEGER DEFAULT 0`);
+    }
+    if (!telemetryInfo.some(c => c.name === 'first_500_at_request')) {
+      db.exec(`ALTER TABLE scrape_telemetry ADD COLUMN first_500_at_request INTEGER DEFAULT 0`);
+    }
 
     const jobsInfo = db.prepare(`PRAGMA table_info(jobs)`).all() as any[];
     const jobsColNames = jobsInfo.map(c => c.name);

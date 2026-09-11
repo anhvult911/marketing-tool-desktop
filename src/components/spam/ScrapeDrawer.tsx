@@ -90,6 +90,18 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
   const [queueBusy, setQueueBusy] = useState(false);
   const [queueHours, setQueueHours] = useState(8);
   const [queueIntervalHours, setQueueIntervalHours] = useState(6);
+  // P5 — sức khoẻ cào + khuyến nghị auto-tune
+  const [health, setHealth] = useState<{
+    windowHours: number;
+    totalRows: number;
+    engines: Array<{ engine: string; chains: number; leads: number; http500: number; leadsPerHour: number }>;
+    accounts: Array<{
+      accountId: number; username: string; status: string; chains: number; leads: number;
+      leadsPerHour: number; fiveHundredRate: number; recommendation: { pacingMs: number; cooldownMs: number; note: string; confident: boolean };
+    }>;
+    measured: { chainLeads?: number; sessionMin?: number; successRate?: number } | null;
+  } | null>(null);
+  const [healthOpen, setHealthOpen] = useState(false);
 
   const fetchAccounts = async () => {
     const data = await safeFetchJson('/api/accounts');
@@ -117,6 +129,19 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
   const fetchQueueState = async () => {
     const data = await safeFetchJson('/api/spam/scrape-queue');
     if (data.success) setQueueState(data.data);
+  };
+
+  const fetchHealth = async () => {
+    const data = await safeFetchJson('/api/spam/telemetry?hours=168');
+    if (data.success) {
+      setHealth({
+        windowHours: data.windowHours,
+        totalRows: data.totalRows,
+        engines: data.engines || [],
+        accounts: data.accounts || [],
+        measured: data.measured || null,
+      });
+    }
   };
 
   const controlQueue = async (action: 'start' | 'stop') => {
@@ -152,6 +177,7 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
       fetchJobs();
       fetchAccounts();
       fetchQueueState();
+      fetchHealth();
     }
   }, [isOpen]);
 
@@ -873,6 +899,89 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
                       </strong>
                       {' · '}Đã xử lý {queueState.processed}/{queueState.totalDue} mục tiêu, thu {queueState.scraped} lead
                       {queueState.lastMessage ? <> — {queueState.lastMessage}</> : null}
+                    </div>
+                  )}
+                </div>
+
+                {/* P5 — Sức khoẻ cào & auto-tune từ telemetry */}
+                <div style={{
+                  backgroundColor: 'rgba(34, 197, 94, 0.06)',
+                  border: '1px solid rgba(34, 197, 94, 0.25)',
+                  borderRadius: '8px',
+                  padding: '0.75rem 1rem',
+                  fontSize: '0.78rem'
+                }}>
+                  <div
+                    style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                    onClick={() => { setHealthOpen(v => !v); if (!healthOpen) fetchHealth(); }}
+                  >
+                    <span style={{ fontWeight: 700, color: '#4ade80' }}>
+                      📈 Sức khoẻ cào & tự điều chỉnh tốc độ (7 ngày)
+                    </span>
+                    <span style={{ color: 'var(--text-secondary)', fontSize: '0.72rem' }}>
+                      {healthOpen ? '▲ Thu gọn' : '▼ Xem chi tiết'}
+                    </span>
+                  </div>
+
+                  {healthOpen && (
+                    <div style={{ marginTop: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                      {!health || health.totalRows === 0 ? (
+                        <div style={{ color: 'var(--text-secondary)' }}>
+                          Chưa có dữ liệu telemetry trong 7 ngày — hệ thống dùng pacing/cooldown mặc định cho tới khi đo được.
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', color: 'var(--text-secondary)' }}>
+                            <span>Phiên đo: <strong style={{ color: 'var(--text-primary)' }}>{health.totalRows}</strong></span>
+                            {health.measured?.chainLeads !== undefined && (
+                              <span>Đo thực: <strong style={{ color: '#4ade80' }}>{health.measured.chainLeads} lead/chuỗi · {health.measured.sessionMin} phút/phiên</strong></span>
+                            )}
+                            {health.engines.map(e => (
+                              <span key={e.engine}>
+                                {e.engine}: <strong style={{ color: 'var(--text-primary)' }}>{e.leads} lead</strong>
+                                {e.leadsPerHour > 0 ? <> ({e.leadsPerHour}/giờ)</> : null}
+                                {e.http500 > 0 ? <span style={{ color: '#f87171' }}> · {e.http500} lỗi 500</span> : null}
+                              </span>
+                            ))}
+                          </div>
+
+                          {health.accounts.length > 0 && (
+                            <div style={{ overflowX: 'auto' }}>
+                              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.72rem' }}>
+                                <thead>
+                                  <tr style={{ color: 'var(--text-secondary)', textAlign: 'left' }}>
+                                    <th style={{ padding: '0.2rem 0.4rem' }}>Account</th>
+                                    <th style={{ padding: '0.2rem 0.4rem' }}>Lead</th>
+                                    <th style={{ padding: '0.2rem 0.4rem' }}>Lead/giờ</th>
+                                    <th style={{ padding: '0.2rem 0.4rem' }}>Lỗi 500</th>
+                                    <th style={{ padding: '0.2rem 0.4rem' }}>Pacing đề xuất</th>
+                                    <th style={{ padding: '0.2rem 0.4rem' }}>Ghi chú</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {health.accounts.slice(0, 6).map(a => (
+                                    <tr key={a.accountId} style={{ borderTop: '1px solid var(--border-color)' }}>
+                                      <td style={{ padding: '0.2rem 0.4rem', color: a.status === 'live' ? '#4ade80' : 'var(--text-secondary)' }}>
+                                        @{a.username}
+                                      </td>
+                                      <td style={{ padding: '0.2rem 0.4rem' }}>{a.leads}</td>
+                                      <td style={{ padding: '0.2rem 0.4rem' }}>{a.leadsPerHour || '—'}</td>
+                                      <td style={{ padding: '0.2rem 0.4rem', color: a.fiveHundredRate >= 0.1 ? '#f87171' : 'inherit' }}>
+                                        {a.fiveHundredRate > 0 ? `${(a.fiveHundredRate * 100).toFixed(1)}%` : '0%'}
+                                      </td>
+                                      <td style={{ padding: '0.2rem 0.4rem' }}>
+                                        {a.recommendation.pacingMs}ms · {Math.round(a.recommendation.cooldownMs / 60000)}'
+                                        {a.recommendation.confident ? '' : ' (mặc định)'}
+                                      </td>
+                                      <td style={{ padding: '0.2rem 0.4rem', color: 'var(--text-secondary)' }}>{a.recommendation.note}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>

@@ -7,6 +7,7 @@ import { normalizeLeadValue } from './lead-normalize';
 import { scrapeLimiter, ConcurrencyLimiter } from './concurrency';
 import { ScrapeAccountPool } from './scrape-pool';
 import { ScrapeTaskBoard } from './scrape-tasks';
+import { summarizeByAccount, recommendPacing, withinWindow, TelemetryRow } from './scrape-telemetry';
 import type { ClaimedTask } from './scrape-tasks';
 import { sendDesktopNotification } from './notify';
 import { launchRobustPersistentContext, launchRobustBrowser } from './browser-launcher';
@@ -1992,8 +1993,10 @@ export async function harvestFollowersByCursor(
   maxLeads: number,
   cancelSignal: { cancelled: boolean },
   requestBudget: { remaining: number; onSpend?: () => void },
-  onProgress?: (newLeads: number, cursor: string | null) => void
-): Promise<{ newLeads: number; nextCursor: string | null; ended: string; http500: number }> {
+  onProgress?: (newLeads: number, cursor: string | null) => void,
+  /** P5 — pacing khởi điểm đo từ telemetry account này (mặc định 3200ms) */
+  initialPacingMs?: number
+): Promise<{ newLeads: number; nextCursor: string | null; ended: string; http500: number; first500AtRequest: number }> {
   // v2: nếu template capture chưa đủ (thiếu postParams — GET capture), tự nạp token
   // từ trang để build body hoàn chỉnh; đủ thì vẫn nạp để refresh dtsg mới nhất.
   await harvestGraphQLTokens(page, capture);
@@ -2030,9 +2033,12 @@ export async function harvestFollowersByCursor(
   let newLeads = 0;
   let emptyStreak = 0;           // trang rỗng còn cursor (soft-throttle signal)
   let http500Count = 0;          // CD5: đếm 500/phiên — telemetry cảnh báo pacing vượt ngưỡng
+  let first500AtRequest = 0;     // P5: request thứ mấy thì dính 500 đầu tiên (0 = không)
   let consecutiveSlow = 0;       // latency tăng liên tục (throttle sớm)
   let lastLatencyMs = 0;
-  let pacingMs = 3200;           // CD2: cơ sở 3.2s — floor 3s (FB 500 với pacing <2.5s)
+  // CD2: cơ sở 3.2s — floor 3s (FB 500 với pacing <2.5s).
+  // P5 — telemetry account có thể siết lên (500 nhiều) nhưng không bao giờ dưới sàn.
+  let pacingMs = Math.max(3000, Math.min(8000, initialPacingMs || 3200));
   let requestCount = 0;
   // FB dùng key cursor không thống nhất giữa các query: 'cursor' phổ biến,
   // một số query dùng 'after' / 'afterCursor'. Thử tuần tự khi key hiện tại không tiến.
@@ -2055,8 +2061,8 @@ export async function harvestFollowersByCursor(
   let reqSinceLead = 0;
 
   while (newLeads < maxLeads && !cancelSignal.cancelled) {
-    if (page.isClosed()) return { newLeads, nextCursor: currentCursor, ended: 'error', http500: http500Count };
-    if (requestBudget.remaining <= 0) return { newLeads, nextCursor: currentCursor, ended: 'budget', http500: http500Count };
+    if (page.isClosed()) return { newLeads, nextCursor: currentCursor, ended: 'error', http500: http500Count, first500AtRequest };
+    if (requestBudget.remaining <= 0) return { newLeads, nextCursor: currentCursor, ended: 'budget', http500: http500Count, first500AtRequest };
     if (reqSinceLead >= 3 && capture.cursor && capture.cursor !== currentCursor) {
       console.log(`[Followers Cursor] Cursor resume chết — chuyển sang cursor tươi từ trang.`);
       currentCursor = capture.cursor;
@@ -2110,13 +2116,13 @@ export async function harvestFollowersByCursor(
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[Followers Cursor] Fetch lỗi: ${msg}`);
-      return { newLeads, nextCursor: currentCursor, ended: 'error', http500: http500Count };
+      return { newLeads, nextCursor: currentCursor, ended: 'error', http500: http500Count, first500AtRequest };
     }
 
     // 429 = rate limit cứng → dừng ngay, giữ cursor
     if (fetchResult.status === 429) {
       console.warn('[Followers Cursor] HTTP 429 — dừng phiên, giữ cursor để resume.');
-      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count };
+      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count, first500AtRequest };
     }
     if (fetchResult.status !== 200) {
       // 5xx = FB bắt đầu chặn chuỗi phân trang (~18 req kịch trần trên IP này).
@@ -2124,14 +2130,15 @@ export async function harvestFollowersByCursor(
       // hoặc phiên sau tiếp tục — KHÔNG retry 4 lần liên tiếp (8s->16s->32s->64s) gây nóng IP
       // và kích hoạt forced-logout của Facebook.
       http500Count++;
+      if (first500AtRequest === 0) first500AtRequest = requestCount;
       console.warn(`[Followers Cursor] HTTP ${fetchResult.status} — chuỗi phân trang chạm trần (~18 req). Dừng phiên ngay, giữ cursor để đổi IP.`);
-      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count };
+      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count, first500AtRequest };
     }
 
     const text = fetchResult.text || '';
     if (text.includes('login_form') || text.includes('checkpoint') || text.includes('/login.php')) {
       console.warn('[Followers Cursor] Response chuyển hướng login/checkpoint — dừng phiên.');
-      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count };
+      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count, first500AtRequest };
     }
 
     // Parse NDJSON / JSON đơn
@@ -2160,7 +2167,7 @@ export async function harvestFollowersByCursor(
 
     // Cursor không tiến (giống cursor cũ) hoặc 0 lead → soft-throttle signal
     if (!pageCursor || pageCursor === currentCursor) {
-      if (!pageCursor) return { newLeads, nextCursor: currentCursor, ended: 'done', http500: http500Count };
+      if (!pageCursor) return { newLeads, nextCursor: currentCursor, ended: 'done', http500: http500Count, first500AtRequest };
       // Fallback: key cursor hiện tại không hiệu quả → thử key kế tiếp trước khi kết luận throttle
       if (cursorKeyIdx < cursorKeys.length - 1) {
         cursorKeyIdx++;
@@ -2179,7 +2186,7 @@ export async function harvestFollowersByCursor(
     else reqSinceLead = 0;
     if (emptyStreak >= 3) {
       console.warn(`[Followers Cursor] Soft-throttle: ${emptyStreak} trang rỗng/lặp cursor. Dừng phiên, giữ cursor.`);
-      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count };
+      return { newLeads, nextCursor: currentCursor, ended: 'throttled', http500: http500Count, first500AtRequest };
     }
 
     // CD2 — pacing floor 3s: FB 2026-09 siết phân trang replay <2.5s/request → 500 ngay.
@@ -2199,7 +2206,7 @@ export async function harvestFollowersByCursor(
     }
   }
 
-  return { newLeads, nextCursor: currentCursor, ended: cancelSignal.cancelled ? 'cancelled' : 'done', http500: http500Count };
+  return { newLeads, nextCursor: currentCursor, ended: cancelSignal.cancelled ? 'cancelled' : 'done', http500: http500Count, first500AtRequest };
 }
 
 /**
@@ -2582,6 +2589,30 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       db.prepare(`UPDATE scrape_jobs SET last_cursor = ?, resume_target_idx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(cursor, targetIdx, jobId);
     };
 
+    // P5 — nạp khuyến nghị pacing/cooldown từ telemetry 7 ngày, tính MỘT LẦN khi
+    // mở job (mỗi chain chỉ tra Map trong RAM, không query lại).
+    const pacingByAccount = new Map<number, { pacingMs: number; cooldownMs: number; note: string }>();
+    try {
+      const telRows = db.prepare(`
+        SELECT t.account_id, t.engine, t.requests, t.leads_new, t.http_500,
+               t.duration_ms, t.first_500_at_request, t.created_at
+        FROM scrape_telemetry t
+        JOIN scrape_jobs j ON j.id = t.job_id
+        WHERE j.workspace_id = ?
+        ORDER BY t.id DESC LIMIT 3000
+      `).all(workspaceId) as TelemetryRow[];
+      const windowed = withinWindow(telRows, Date.now(), 7 * 24 * 3600_000);
+      for (const stats of summarizeByAccount(windowed)) {
+        const rec = recommendPacing(stats);
+        pacingByAccount.set(stats.accountId, { pacingMs: rec.pacingMs, cooldownMs: rec.cooldownMs, note: rec.note });
+        if (rec.confident) {
+          console.log(`[FB Scraper] 📈 Auto-tune Account #${stats.accountId}: pacing ${rec.pacingMs}ms, cooldown ${Math.round(rec.cooldownMs / 60000)}' — ${rec.note}`);
+        }
+      }
+    } catch (telErr: unknown) {
+      console.warn('[FB Scraper] Bỏ qua auto-tune telemetry:', telErr instanceof Error ? telErr.message : telErr);
+    }
+
     // Cache capability theo target (probe 1 lần/target cho cả job) + cờ gap-fill 1 lần
     const capabilityCache: Array<TargetCapability | null> = targetList.map(() => null);
     const groupDomDone = targetList.map(() => false);
@@ -2591,6 +2622,10 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       leads: number;
       requests: number;
       http500: number;
+      /** P5 — request index của lần 500 đầu tiên (0 = không dính) */
+      first500AtRequest: number;
+      /** P5 — thời lượng chain (ms) để tính leads/giờ */
+      durationMs: number;
       dead: boolean;
       throttled: boolean;
       finished: boolean;
@@ -2603,7 +2638,8 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     const runChain = async (accountId: number, task: ClaimedTask, pass: number): Promise<AccountChainOutcome> => {
       const targetIdx = task.targetIdx;
       const currentTarget = parseFacebookTarget(targetList[targetIdx]);
-      const out: AccountChainOutcome = { leads: 0, requests: 0, http500: 0, dead: false, throttled: false, finished: false };
+      const chainStartedAt = Date.now();
+      const out: AccountChainOutcome = { leads: 0, requests: 0, http500: 0, first500AtRequest: 0, durationMs: 0, dead: false, throttled: false, finished: false };
       const spareProxy = pass >= 2 ? pickSpareProxy(accountId) : undefined;
       let browserContext: BrowserContext | null = null;
       let sessionRequestsUsed = 0;
@@ -2805,11 +2841,13 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
                       remaining(), cancelSignal, followerBudget,
                       (_n: number, cur: string | null) => {
                         if (cur) setCursorForTarget(targetIdx, cur);
-                      }
+                      },
+                      pacingByAccount.get(accountId)?.pacingMs
                     );
                     out.leads += result.newLeads;
                     sessionHttp500 += result.http500;
                     if (result.ended === 'throttled') out.throttled = true;
+                    if (result.first500AtRequest > 0 && out.first500AtRequest === 0) out.first500AtRequest = result.first500AtRequest;
                     if (result.nextCursor) setCursorForTarget(targetIdx, result.nextCursor);
                     else cursorsByTarget[targetIdx] = null;
                     console.log(`[FB Scraper] ⚡ Cursor replay: +${result.newLeads} leads (kết thúc: ${result.ended}, 500s: ${result.http500}).`);
@@ -2897,9 +2935,13 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       } finally {
         try {
           db.prepare(`
-            INSERT INTO scrape_telemetry (job_id, account_id, engine, requests, leads_new, throttle_events, http_500)
-            VALUES (?, ?, ?, ?, ?, 0, ?)
-          `).run(jobId, accountId, `chain_${task.channel}`, sessionRequestsUsed || 0, out.leads || 0, sessionHttp500 || 0);
+            INSERT INTO scrape_telemetry (job_id, account_id, engine, requests, leads_new, throttle_events, http_500, duration_ms, first_500_at_request)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+          `).run(
+            jobId, accountId, `chain_${task.channel}`,
+            sessionRequestsUsed || 0, out.leads || 0, sessionHttp500 || 0,
+            out.durationMs || 0, out.first500AtRequest || 0
+          );
         } catch (telErr: unknown) {
           console.warn(`[FB Scraper] Telemetry insert lỗi:`, telErr instanceof Error ? telErr.message : telErr);
         }
@@ -2910,6 +2952,7 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       }
       out.requests = sessionRequestsUsed;
       out.http500 = sessionHttp500;
+      out.durationMs = Date.now() - chainStartedAt;
       return out;
     };
 
@@ -2958,12 +3001,15 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           console.warn(`[FB Scraper] Account #${accountId} throttle (lần ${throttleCount + 1}/24h) — cooldown ${cooldownMin} phút, cursor đã giữ.`);
         }
 
+        // P5 — cooldown nền lấy từ telemetry (nếu có), đè bởi luật cứng khi chain
+        // rỗng/quota cạn; throttle luôn dùng cooldown ngắn để nhường slot.
+        const tunedCooldown = pacingByAccount.get(accountId)?.cooldownMs;
         const cooldownMs = outcome?.throttled
           ? 2 * 60_000
           : chainLeads === 0
             ? 5 * 60_000
             : chainLeads >= maxPerAccountQuota
-              ? 10 * 60_000
+              ? (tunedCooldown ?? 10 * 60_000)
               : 60_000;
         pool.noteChainDone(accountId, { now: Date.now(), cooldownMs, unproductive: chainLeads === 0, maxUnproductive: 2 });
         pass++;

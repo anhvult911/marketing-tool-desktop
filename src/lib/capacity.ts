@@ -21,10 +21,27 @@ export const MEASURED = {
   PASSIVE_SUCCESS_RATE: 0.8,
 } as const;
 
+export interface CapacityOverrides {
+  /** P5 — leads/chuỗi đo từ telemetry (mặc định 144) */
+  chainLeads?: number;
+  /** P5 — thời gian 1 chuỗi (phút) đo từ telemetry (mặc định SESSION_MIN) */
+  sessionMin?: number;
+  /** P5 — tỷ lệ chuỗi có lead đo từ telemetry (mặc định PASSIVE_SUCCESS_RATE) */
+  successRate?: number;
+}
+
+/** Kẹp giá trị đo về khoảng hợp lệ — dữ liệu bẩn không được tạo kế hoạch ảo. */
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
+}
+
 export interface PoolInput {
   liveAccounts: number;      // số account Facebook cookie sống
   spareProxies: number;      // số proxy 'working' KHÔNG gắn account nào
   targetLeads: number;       // mục tiêu leads cần thu
+  /** P5 — giá trị đo thực, ghi đè hằng số mặc định khi đủ mẫu */
+  overrides?: CapacityOverrides;
 }
 
 export interface CapacityPlan {
@@ -48,11 +65,30 @@ export function planCapacity(input: PoolInput): CapacityPlan {
   const { liveAccounts, spareProxies, targetLeads } = input;
   const notes: string[] = [];
 
-  const effectiveLeadsPerChain = Math.floor(MEASURED.CHAIN_LEADS * MEASURED.PASSIVE_SUCCESS_RATE); // 115
+  // P5 — hằng số hiệu lực: ưu tiên giá trị đo từ telemetry khi có, nếu không dùng
+  // hằng số đo tay 2026-09-09. Mọi giá trị override đều được kẹp về khoảng hợp lệ
+  // để dữ liệu bẩn không tạo kế hoạch ảo.
+  const chainLeads = clamp(input.overrides?.chainLeads ?? MEASURED.CHAIN_LEADS, 8, 2000);
+  const sessionMin = clamp(input.overrides?.sessionMin ?? MEASURED.SESSION_MIN, 1, 60);
+  const successRate = clamp(input.overrides?.successRate ?? MEASURED.PASSIVE_SUCCESS_RATE, 0.1, 1);
+  const usedMeasured = Boolean(
+    input.overrides && (
+      input.overrides.chainLeads !== undefined ||
+      input.overrides.sessionMin !== undefined ||
+      input.overrides.successRate !== undefined
+    )
+  );
+  if (usedMeasured) {
+    notes.push(`Dùng số liệu ĐO THỰC từ telemetry: ${Math.round(chainLeads)} leads/chuỗi, ${sessionMin.toFixed(1)} phút/phiên, tỷ lệ thành công ${Math.round(successRate * 100)}%.`);
+  }
+
+  // Sàn 1 lead/chuỗi: chuỗi 0 lead là account chết, không phải "năng suất thấp" —
+  // để 0 sẽ làm hoursToTarget = Infinity và recommendedAccounts phình vô nghĩa.
+  const effectiveLeadsPerChain = Math.max(1, Math.floor(chainLeads * successRate));
 
   // Chu kỳ 1 chuỗi + nghỉ: có proxy rảnh → nghỉ nửa cooldown (5'), không có → đủ 10'
-  const restWithSpare = (MEASURED.CHAIN_COOLDOWN_MIN / 2) + MEASURED.SESSION_MIN; // 12 phút/chuỗi
-  const restWithoutSpare = MEASURED.CHAIN_COOLDOWN_MIN + MEASURED.SESSION_MIN;    // 17 phút/chuỗi
+  const restWithSpare = (MEASURED.CHAIN_COOLDOWN_MIN / 2) + sessionMin; // phút/chuỗi
+  const restWithoutSpare = MEASURED.CHAIN_COOLDOWN_MIN + sessionMin;    // phút/chuỗi
 
   // Trung bình pool: số chuỗi/giờ mỗi account phụ thuộc tỉ lệ có spare proxy
   // Pass 1 dùng proxy mặc định (không tốn spare). Từ pass 2 mỗi chuỗi cần 1 spare.
