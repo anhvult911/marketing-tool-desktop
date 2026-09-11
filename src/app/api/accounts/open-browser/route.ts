@@ -64,11 +64,9 @@ export async function POST(request: Request) {
     const launchOpts: any = {
       headless: false,
       viewport: { width: 1280, height: 800 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      // KHÔNG set userAgent — Chrome thật của user + UA thật (khớp Sec-Ch-Ua tự gắn)
       args: [
-        '--disable-blink-features=AutomationControlled',
-        '--no-sandbox',
-        '--disable-setuid-sandbox'
+        '--disable-blink-features=AutomationControlled'
       ]
     };
 

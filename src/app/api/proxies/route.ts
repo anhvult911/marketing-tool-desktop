@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server';
 import db from '@/lib/db';
 import { getAuthSession } from '@/lib/auth';
+import { parseProxyLine } from '@/lib/proxy-utils';
+
+export const dynamic = 'force-dynamic';
 
 export async function GET(request: Request) {
   try {
@@ -34,50 +37,61 @@ export async function POST(request: Request) {
 
     const { rawText } = await request.json();
     if (!rawText || typeof rawText !== 'string') {
-      return NextResponse.json({ success: false, error: 'Dữ liệu không hợp lệ.' }, { status: 400 });
+      return NextResponse.json({ success: false, error: 'Dữ liệu không hợp lệ. Vui lòng nhập danh sách proxy.' }, { status: 400 });
     }
 
-    const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
-    const parsedProxies: Array<{ host: string; port: number; username?: string; password?: string }> = [];
+    const lines = rawText.split('\n').map((l: string) => l.trim()).filter(Boolean);
+    const parsedProxies = lines
+      .map((line: string) => parseProxyLine(line))
+      .filter((p: any): p is NonNullable<typeof p> => p !== null);
 
-    for (const line of lines) {
-      if (line.includes('@')) {
-        const [auth, hostPort] = line.split('@');
-        const [username, password] = auth.split(':');
-        const [host, portStr] = hostPort.split(':');
-        const port = parseInt(portStr, 10);
-        if (host && port) {
-          parsedProxies.push({ host, port, username, password });
-        }
-      } else {
-        const parts = line.split(':');
-        if (parts.length >= 2) {
-          const host = parts[0];
-          const port = parseInt(parts[1], 10);
-          const username = parts[2] || undefined;
-          const password = parts[3] || undefined;
-          if (host && port) {
-            parsedProxies.push({ host, port, username, password });
-          }
+    if (parsedProxies.length === 0) {
+      return NextResponse.json({ 
+        success: false, 
+        error: 'Không nhận diện được định dạng proxy nào. Hỗ trợ các định dạng: host:port, host:port:user:pass, user:pass@host:port, host|port|user|pass hoặc http/socks5.' 
+      }, { status: 400 });
+    }
+
+    const checkExistingStmt = db.prepare(`
+      SELECT id FROM proxies WHERE host = ? AND port = ? AND workspace_id = ?
+    `);
+
+    const updateStmt = db.prepare(`
+      UPDATE proxies SET username = ?, password = ?, protocol = ?, status = 'active' WHERE id = ?
+    `);
+
+    const insertStmt = db.prepare(`
+      INSERT INTO proxies (host, port, username, password, protocol, workspace_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
+    let newCount = 0;
+    let updatedCount = 0;
+
+    const saveMany = db.transaction(() => {
+      for (const item of parsedProxies) {
+        const existing = checkExistingStmt.get(item.host, item.port, workspaceId) as any;
+        if (existing) {
+          updateStmt.run(item.username || null, item.password || null, item.protocol || 'http', existing.id);
+          updatedCount++;
+        } else {
+          insertStmt.run(item.host, item.port, item.username || null, item.password || null, item.protocol || 'http', workspaceId);
+          newCount++;
         }
       }
-    }
+    });
 
-    if (parsedProxies.length > 0) {
-      const insertStmt = db.prepare(`
-        INSERT INTO proxies (host, port, username, password, workspace_id)
-        VALUES (?, ?, ?, ?, ?)
-      `);
+    saveMany();
 
-      const insertMany = db.transaction(() => {
-        for (const item of parsedProxies) {
-          insertStmt.run(item.host, item.port, item.username || null, item.password || null, workspaceId);
-        }
-      });
-      insertMany();
-    }
+    const summaryMsg = updatedCount > 0 
+      ? `Đã thêm ${newCount} proxy mới và cập nhật ${updatedCount} proxy đã có.`
+      : `Đã nhập thành công ${newCount} proxy.`;
 
-    return NextResponse.json({ success: true, count: parsedProxies.length, message: `Đã nhập thành công ${parsedProxies.length} proxy.` });
+    return NextResponse.json({ 
+      success: true, 
+      count: parsedProxies.length, 
+      message: summaryMsg 
+    });
   } catch (error: any) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }

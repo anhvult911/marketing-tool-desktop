@@ -10,6 +10,12 @@ export function sendDesktopNotification(title: string, body: string) {
       return;
     }
 
+    // 1b. Node.js Child Process fork (môi trường dev)
+    if (typeof process !== 'undefined' && typeof (process as any).send === 'function') {
+      (process as any).send({ type: 'notify', title, body });
+      return;
+    }
+
     // 2. Renderer Process (giao diện Next.js chạy trong BrowserWindow)
     if (typeof window !== 'undefined' && (window as any).electronAPI?.notify) {
       (window as any).electronAPI.notify(title, body);

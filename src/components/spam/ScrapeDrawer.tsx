@@ -64,6 +64,7 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
   const [autoImport, setAutoImport] = useState(true);
   const [scrapeType, setScrapeType] = useState<'members' | 'chat_history' | 'hybrid' | 'kol_followers' | 'post_commenters' | 'multi_tier'>('multi_tier');
   const [customTag, setCustomTag] = useState('');
+  const [parallelSessions, setParallelSessions] = useState<number>(3);
   
   const [activeTab, setActiveTab] = useState<'create' | 'history'>('create');
   const [jobs, setJobs] = useState<ScrapeJob[]>([]);
@@ -206,10 +207,9 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
           targetGroup: targetGroup.trim(),
           accountIds: selectedAccountIds,
           accountId: selectedAccountIds[0],
-          maxLimit,
-          autoImport,
           scrapeType,
           customTag: customTag.trim() || undefined,
+          parallelSessions,
         }),
       });
 
@@ -670,7 +670,7 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
                         Chế độ Quét Toàn Diện Tối Đa (360° All-in-One Multi-Vector)
                       </div>
                       <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', lineHeight: '1.3' }}>
-                        Tự động bóc tách toàn diện: <strong>Người theo dõi + Cảm xúc (Like/Love/Care) + Bình luận & Trả lời + Nhóm cộng đồng</strong> từ Fanpage / Profile / Nhóm mục tiêu.
+                        Tự động bóc tách toàn diện: <strong>Followers Cursor Engine (thu tối đa người theo dõi qua GraphQL phân trang) + Cảm xúc + Bình luận &amp; SĐT</strong> từ Fanpage / Profile / Nhóm mục tiêu. Fanpage chặn follower list sẽ tự chuyển sang engager harvesting.
                       </div>
                     </div>
                   </div>
@@ -718,6 +718,29 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
                     </label>
                   </div>
                 </div>
+                {selectedPlatform !== 'telegram' && (
+                  <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label" style={{ fontSize: '0.8rem' }}>
+                      ⚡ Số phiên browser chạy song song (mỗi phiên = 1 tài khoản + 1 IP):
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                      <input
+                        type="range"
+                        min={1}
+                        max={6}
+                        value={parallelSessions}
+                        onChange={(e) => setParallelSessions(parseInt(e.target.value, 10))}
+                        style={{ flex: 1, cursor: 'pointer' }}
+                      />
+                      <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#38bdf8', minWidth: '3.2rem' }}>
+                        {parallelSessions} phiên
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.25rem', lineHeight: 1.35 }}>
+                      Pool chạy tối đa {Math.min(parallelSessions, Math.max(1, selectedAccountIds.length))} account đồng thời (~{Math.min(parallelSessions, Math.max(1, selectedAccountIds.length)) * 300}–{Math.min(parallelSessions, Math.max(1, selectedAccountIds.length)) * 575} leads/giờ). Tăng khi có nhiều proxy rảnh; máy yếu (RAM &lt; 16GB) nên giữ ≤3.
+                    </div>
+                  </div>
+                )}
 
                 {/* Live Account & Scraping Speed Estimator Widget */}
                 {maxLimit > 0 && (

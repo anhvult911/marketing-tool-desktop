@@ -20,12 +20,12 @@ function getBaseUserDataDir(): string {
 export const USER_DATA_DIR = getBaseUserDataDir();
 
 export const PROFILES_DIR = process.env.NODE_ENV === 'production'
-  ? path.join(USER_DATA_DIR, 'profiles')
-  : path.join(process.cwd(), 'profiles');
+  ? path.join(/*turbopackIgnore: true*/ USER_DATA_DIR, 'profiles')
+  : path.join(/*turbopackIgnore: true*/ process.cwd(), 'profiles');
 
 export const UPLOADS_DIR = process.env.NODE_ENV === 'production'
-  ? path.join(USER_DATA_DIR, 'uploads')
-  : path.join(process.cwd(), 'public', 'uploads');
+  ? path.join(/*turbopackIgnore: true*/ USER_DATA_DIR, 'uploads')
+  : path.join(/*turbopackIgnore: true*/ process.cwd(), 'public', 'uploads');
 
 export const DB_DIR = process.env.NODE_ENV === 'production'
   ? USER_DATA_DIR

@@ -1,41 +1,7 @@
 import { NextResponse } from 'next/server';
 import db from '@/lib/db';
-import net from 'net';
 import { getAuthSession } from '@/lib/auth';
-
-function checkProxy(host: string, port: number, username?: string, password?: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port, timeout: 5000 }, () => {
-      let connectHeader = `CONNECT google.com:443 HTTP/1.1\r\nHost: google.com:443\r\n`;
-      if (username && password) {
-        const auth = Buffer.from(`${username}:${password}`).toString('base64');
-        connectHeader += `Proxy-Authorization: Basic ${auth}\r\n`;
-      }
-      connectHeader += `\r\n`;
-      socket.write(connectHeader);
-    });
-
-    socket.on('data', (data) => {
-      const response = data.toString();
-      if (response.includes('200') || response.includes('Connection established') || response.includes('Established')) {
-        resolve(true);
-      } else {
-        resolve(false);
-      }
-      socket.destroy();
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.on('error', () => {
-      socket.destroy();
-      resolve(false);
-    });
-  });
-}
+import { checkProxyLive } from '@/lib/proxy-utils';
 
 export async function POST(request: Request) {
   try {
@@ -51,7 +17,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ success: false, error: 'Proxy không tồn tại.' }, { status: 404 });
       }
 
-      const isLive = await checkProxy(proxy.host, proxy.port, proxy.username, proxy.password);
+      const isLive = await checkProxyLive(proxy.host, proxy.port, proxy.username, proxy.password);
       const status = isLive ? 'working' : 'dead';
 
       db.prepare(`UPDATE proxies SET status = ? WHERE id = ? AND workspace_id = ?`).run(status, id, workspaceId);
@@ -69,7 +35,7 @@ export async function POST(request: Request) {
 
       const results = await Promise.all(
         proxies.map(async (p) => {
-          const isLive = await checkProxy(p.host, p.port, p.username, p.password);
+          const isLive = await checkProxyLive(p.host, p.port, p.username, p.password);
           const status = isLive ? 'working' : 'dead';
           db.prepare(`UPDATE proxies SET status = ? WHERE id = ? AND workspace_id = ?`).run(status, p.id, workspaceId);
           return { id: p.id, isLive };

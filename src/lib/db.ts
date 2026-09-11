@@ -1,35 +1,10 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
-import postgres from 'postgres';
-
-const databaseUrl = process.env.DATABASE_URL;
-
-// Global PostgreSQL connection for shared DB mode
-declare global {
-  var globalPostgresSql: postgres.Sql | undefined;
-}
-
-export const sql = databaseUrl
-  ? globalThis.globalPostgresSql || postgres(databaseUrl, {
-      max: process.env.NODE_ENV === 'production' ? 20 : 5,
-      idle_timeout: 30,
-      connect_timeout: 10,
-      keep_alive: 30,
-    })
-  : null;
-
-if (databaseUrl && process.env.NODE_ENV !== 'production') {
-  globalThis.globalPostgresSql = sql!;
-  console.log(`[Database] 🐘 Connected to Shared PostgreSQL Database: ${databaseUrl.split('@')[1] || 'configured'}`);
-}
-
 import { DB_PATH } from './paths';
 
 const dbPath = DB_PATH;
-if (!databaseUrl) {
-  console.log(`[Database] 📁 SQLite Local Database active: ${dbPath}`);
-}
+console.log(`[Database] 📁 SQLite Local Database active: ${dbPath}`);
 
 export const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -38,6 +13,7 @@ db.pragma('busy_timeout = 15000');
 db.pragma('cache_size = -64000'); // 64MB In-Memory Cache
 db.pragma('temp_store = MEMORY');
 db.pragma('mmap_size = 268435456'); // 256MB Memory-Mapped I/O
+db.pragma('wal_autocheckpoint = 1000'); // Tự động checkpoint dọn WAL định kỳ tránh phình to hoặc khóa cứng
 
 // Khởi tạo bảng dữ liệu
 export function initDatabaseSchema() {
@@ -101,6 +77,9 @@ export function initDatabaseSchema() {
       target_type TEXT NOT NULL, -- 'user' hoặc 'hashtag'
       target_value TEXT NOT NULL,
       is_active INTEGER DEFAULT 1,
+      last_scraped_id TEXT,
+      template_id INTEGER,
+      keyword_filter TEXT,
       last_scraped_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -232,6 +211,48 @@ export function initDatabaseSchema() {
     if (!colNames.includes('account_ids')) {
       db.exec(`ALTER TABLE scrape_jobs ADD COLUMN account_ids TEXT`);
     }
+    if (!colNames.includes('target_follower_count')) {
+      db.exec(`ALTER TABLE scrape_jobs ADD COLUMN target_follower_count INTEGER DEFAULT 0`);
+    }
+    if (!colNames.includes('target_follower_name')) {
+      db.exec(`ALTER TABLE scrape_jobs ADD COLUMN target_follower_name TEXT`);
+    }
+
+    const socialInfo = db.prepare(`PRAGMA table_info(social_accounts)`).all() as { name: string }[];
+
+    if (!colNames.includes('resume_target_idx')) {
+      db.exec(`ALTER TABLE scrape_jobs ADD COLUMN resume_target_idx INTEGER DEFAULT 0`);
+    }
+
+    const socialColNames = socialInfo.map(c => c.name);
+    if (!socialColNames.includes('daily_request_count')) {
+      db.exec(`ALTER TABLE social_accounts ADD COLUMN daily_request_count INTEGER DEFAULT 0`);
+    }
+    if (!socialColNames.includes('daily_reset_at')) {
+      db.exec(`ALTER TABLE social_accounts ADD COLUMN daily_reset_at DATETIME`);
+    }
+    if (!socialColNames.includes('cooldown_until')) {
+      db.exec(`ALTER TABLE social_accounts ADD COLUMN cooldown_until DATETIME`);
+    }
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS scrape_telemetry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id INTEGER NOT NULL,
+        account_id INTEGER,
+        engine TEXT NOT NULL,
+        requests INTEGER DEFAULT 0,
+        leads_new INTEGER DEFAULT 0,
+        throttle_events INTEGER DEFAULT 0,
+        http_500 INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_scrape_telemetry_job ON scrape_telemetry(job_id);
+    `);
+    const telemetryInfo = db.prepare(`PRAGMA table_info(scrape_telemetry)`).all() as { name: string }[];
+    if (!telemetryInfo.some(c => c.name === 'http_500')) {
+      db.exec(`ALTER TABLE scrape_telemetry ADD COLUMN http_500 INTEGER DEFAULT 0`);
+    }
 
     const jobsInfo = db.prepare(`PRAGMA table_info(jobs)`).all() as any[];
     const jobsColNames = jobsInfo.map(c => c.name);
@@ -248,6 +269,17 @@ export function initDatabaseSchema() {
       db.exec(`ALTER TABLE spam_leads ADD COLUMN avatar_url TEXT`);
     }
 
+    const targetsInfo = db.prepare(`PRAGMA table_info(scrape_targets)`).all() as any[];
+    const targetCols = targetsInfo.map(c => c.name);
+    if (!targetCols.includes('last_scraped_id')) {
+      db.exec(`ALTER TABLE scrape_targets ADD COLUMN last_scraped_id TEXT`);
+    }
+    if (!targetCols.includes('template_id')) {
+      db.exec(`ALTER TABLE scrape_targets ADD COLUMN template_id INTEGER`);
+    }
+    if (!targetCols.includes('keyword_filter')) {
+      db.exec(`ALTER TABLE scrape_targets ADD COLUMN keyword_filter TEXT`);
+    }
     // Clean up any group paths in value to extract pure UID
     const uncleanedLeads = db.prepare(`SELECT id, value, display_name FROM spam_leads WHERE value LIKE '%/user/%'`).all() as any[];
     if (uncleanedLeads.length > 0) {

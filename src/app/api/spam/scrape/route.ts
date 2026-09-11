@@ -48,11 +48,18 @@ export async function POST(request: Request) {
       accountIds,
       autoImport = true,
       customTag,
-      targetCampaignId
+      targetCampaignId,
+      parallelSessions
     } = body;
 
     if (!targetGroup || !targetGroup.trim()) {
       return NextResponse.json({ success: false, error: 'Link nhóm hoặc Fanpage mục tiêu không được để trống.' }, { status: 400 });
+    }
+    // B3: multi-target — mỗi dòng (hoặc phân tách bằng dấu phẩy) là 1 target.
+    // Job 1 hàng đợi duyệt tuần tự, dedup chung qua collectedUids của job.
+    const targetList = targetGroup.split(/[\n,]+/).map((t: string) => t.trim()).filter(Boolean);
+    if (targetList.length > 20) {
+      return NextResponse.json({ success: false, error: 'Tối đa 20 target mỗi job.' }, { status: 400 });
     }
 
     const res = db.prepare(`
@@ -65,7 +72,7 @@ export async function POST(request: Request) {
     `).run(
       workspaceId, 
       platform, 
-      targetGroup.trim(), 
+      targetList.join('\n'), 
       autoImport ? 1 : 0, 
       targetCampaignId || null, 
       scrapeType, 
@@ -90,6 +97,7 @@ export async function POST(request: Request) {
           maxLimit,
           autoImport: !!autoImport,
           scrapeType,
+          parallelSessions,
           customTag: customTag ? customTag.trim() : undefined,
           targetCampaignId
         }).catch(err => {

@@ -147,32 +147,21 @@ export default function Home() {
       setLoading(true);
       setError(null);
       const res = await fetch('/api/analytics');
-      if (res.status === 401) {
-        window.location.href = '/login';
-        return;
-      }
       const text = await res.text();
       if (!text || !text.trim()) {
-        setError(`Máy chủ phản hồi rỗng (HTTP ${res.status}). Vui lòng kiểm tra lại.`);
+        setError(`Máy chủ phản hồi rỗng (HTTP ${res.status}). Đang thử kết nối lại...`);
         return;
       }
       let json: any;
       try {
         json = JSON.parse(text);
       } catch {
-        setError('Phiên đăng nhập đã hết hạn hoặc máy chủ chưa sẵn sàng. Đang chuyển hướng...');
-        setTimeout(() => {
-          window.location.href = '/login';
-        }, 1200);
+        setError('Đang khởi động dữ liệu hệ thống, vui lòng chờ trong giây lát...');
         return;
       }
       if (json.success) {
         setData(json.data);
       } else {
-        if (res.status === 401 || json.error?.toLowerCase().includes('đăng nhập')) {
-          window.location.href = '/login';
-          return;
-        }
         setError(json.error || 'Không thể tải dữ liệu Dashboard.');
       }
     } catch (err: any) {

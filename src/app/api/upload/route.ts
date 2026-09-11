@@ -22,6 +22,9 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: false, error: 'Không tìm thấy tệp tải lên.' }, { status: 400 });
     }
 
+    const ALLOWED_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.webm', '.mov']);
+    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+
     const uploadDir = UPLOADS_DIR;
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
@@ -31,12 +34,27 @@ export async function POST(request: Request) {
 
     for (const file of files) {
       if (!(file instanceof File)) continue;
+
+      const ext = path.extname(file.name || '').toLowerCase();
+      if (!ALLOWED_EXTENSIONS.has(ext)) {
+        return NextResponse.json({ 
+          success: false, 
+          error: `Định dạng tệp "${file.name}" không được hỗ trợ. Chỉ cho phép các định dạng hình ảnh/video: ${Array.from(ALLOWED_EXTENSIONS).join(', ')}` 
+        }, { status: 400 });
+      }
+
+      if (file.size > MAX_FILE_SIZE) {
+        return NextResponse.json({ 
+          success: false, 
+          error: `Tệp tin "${file.name}" vượt quá dung lượng tối đa cho phép (50MB).` 
+        }, { status: 400 });
+      }
+
       const bytes = await file.arrayBuffer();
       const buffer = Buffer.from(bytes);
 
-      // Generate a unique filename
+      // Generate a unique safe filename
       const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-      const ext = path.extname(file.name);
       const filename = `${uniqueSuffix}${ext}`;
       const filePath = path.join(uploadDir, filename);
 

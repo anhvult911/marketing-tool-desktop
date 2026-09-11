@@ -1,10 +1,13 @@
 import { chromium as baseChromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
 import fs from 'fs';
-import { execSync } from 'child_process';
 import { NetworkScraperEngine } from './network-scraper';
 import { PROFILES_DIR } from '../src/lib/paths';
 import { launchRobustPersistentContext } from '../src/lib/browser-launcher';
+import { killProfileProcesses } from '../src/lib/profile-lock';
+import { getRealUserAgentSync } from '../src/lib/user-agent';
+
+export { killProfileProcesses };
 
 // Tự động phát hiện và fallback trình duyệt Playwright sang Edge hoặc Chrome hệ thống nếu thiếu Chromium
 const chromium = {
@@ -14,59 +17,6 @@ const chromium = {
   },
 };
 
-// Helper to kill browser processes locking a profile (Tối ưu hóa tốc độ, tránh freeze)
-export function killProfileProcesses(userDataDir: string) {
-  try {
-    if (!userDataDir || !fs.existsSync(userDataDir)) return;
-    const profileDirName = path.basename(userDataDir);
-    if (!profileDirName) return;
-
-    const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'lockfile'];
-    let hasLockFiles = false;
-
-    // 1. Thử xóa trực tiếp các lockfile trước (rất nhanh, < 1ms)
-    for (const lf of lockFiles) {
-      const lockPath = path.join(userDataDir, lf);
-      if (fs.existsSync(lockPath)) {
-        hasLockFiles = true;
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          // File đang bị lock bởi tiến trình khác
-        }
-      }
-    }
-
-    // Nếu không có lockfile nào thì không có tiến trình nào đang chiếm profile -> Xong ngay lập tức
-    if (!hasLockFiles) return;
-
-    // 2. Nếu lockfile vẫn bị chiếm, xử lý tắt tiến trình bị kẹt
-    if (process.platform === 'win32') {
-      try {
-        // Dùng wmic terminate trực tiếp, nhanh hơn 10x so với khởi động PowerShell Get-CimInstance
-        execSync(`wmic process where "name='chrome.exe' and commandline like '%${profileDirName}%'" call terminate`, { stdio: 'ignore', timeout: 2000 });
-      } catch {
-        // Fallback nhẹ nếu wmic không khả dụng
-      }
-    } else {
-      try {
-        execSync(`pkill -9 -f "${profileDirName}"`, { stdio: 'ignore', timeout: 2000 });
-      } catch {}
-    }
-
-    // 3. Dọn dẹp lại lockfiles sau khi tắt tiến trình
-    for (const lf of lockFiles) {
-      const lockPath = path.join(userDataDir, lf);
-      if (fs.existsSync(lockPath)) {
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {}
-      }
-    }
-  } catch (err: any) {
-    console.warn(`[Automation] Non-fatal cleanup warning for ${userDataDir}:`, err.message);
-  }
-}
 
 export async function dismissFacebookOverlays(page: any) {
   try {
@@ -460,25 +410,10 @@ export async function applyStealthToContext(context: BrowserContext) {
         get: () => ['vi-VN', 'vi', 'en-US', 'en'],
       });
 
-      // 3. Mock plugins (avoid empty plugins list on Linux Headless)
-      Object.defineProperty(navigator, 'plugins', {
-        get: () => [
-          {
-            0: { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' },
-            description: 'Portable Document Format',
-            filename: 'internal-pdf-viewer',
-            length: 1,
-            name: 'Chrome PDF Plugin',
-          },
-          {
-            0: { type: 'application/pdf', suffixes: 'pdf', description: '' },
-            description: '',
-            filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
-            length: 1,
-            name: 'Chrome PDF Viewer',
-          }
-        ],
-      });
+      // 3. KHÔNG mock navigator.plugins — mock thiếu PluginArray interface thật
+      // (item/namedItem) là detection vector. Trên Windows Chrome thật có PDF plugin
+      // sẵn; tín hiệu thật mạnh hơn giả.
+
 
       // 4. Mock window.chrome runtime
       if (!(window as any).chrome) {
@@ -698,16 +633,13 @@ export function getLaunchOptions(account: AccountConfig, proxy?: ProxyConfig) {
     locale: 'vi-VN',
     timezoneId: 'Asia/Ho_Chi_Minh',
     extraHTTPHeaders: {
-      'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-      'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-      'Sec-Ch-Ua-Mobile': '?0',
-      'Sec-Ch-Ua-Platform': '"Windows"'
+      'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
     },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    // UA thật của binary (gỡ token HeadlessChrome, khớp version). Cache được
+    // populate bởi getRealUserAgent() nơi async được phép; fallback nếu chưa.
+    userAgent: getRealUserAgentSync(),
     args: [
       '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-infobars',
       '--window-position=0,0',
@@ -1342,11 +1274,10 @@ export class TelegramAutomation {
     try {
       const response = await fetch(url, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          'User-Agent': getRealUserAgentSync()
         }
       });
       const html = await response.text();
-      // Extract <meta property="og:title" content="Group Title">
       const ogTitleMatch = html.match(/<meta property="og:title" content="([^"]+)"/i);
       if (ogTitleMatch && ogTitleMatch[1]) {
         // Decode HTML entities if any

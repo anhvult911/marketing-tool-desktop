@@ -45,7 +45,17 @@ export async function POST(request: Request) {
     const session = await getAuthSession(request);
     const workspaceId = session?.activeWorkspaceId || 1;
 
-    const { platform, campaignType, accountIds, templateIds, scheduledStart } = await request.json();
+    const {
+      platform = 'facebook',
+      campaignType = 'comment',
+      accountIds,
+      templateIds,
+      numLeads,
+      leadIds,
+      scheduledStart,
+      desiredDurationMinutes,
+      safetyLevel = 'safe'
+    } = await request.json();
 
     if (!accountIds || !Array.isArray(accountIds) || accountIds.length === 0) {
       return NextResponse.json({ success: false, error: 'Vui lòng chọn ít nhất 1 tài khoản gửi.' }, { status: 400 });
@@ -64,32 +74,129 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: false, error: 'Không tìm thấy mẫu kịch bản hợp lệ.' }, { status: 400 });
     }
 
+    // 1. Phân bổ mục tiêu (Leads) cho chiến dịch
+    let targetLeads: Array<{ id: number; value: string; display_name?: string | null; lead_type?: string | null }> = [];
+
+    if (leadIds && Array.isArray(leadIds) && leadIds.length > 0) {
+      const leadPlaceholders = leadIds.map(() => '?').join(',');
+      targetLeads = db.prepare(`
+        SELECT id, value, display_name, lead_type 
+        FROM spam_leads 
+        WHERE id IN (${leadPlaceholders}) AND workspace_id = ?
+      `).all(...leadIds.map((id: any) => parseInt(id, 10)), workspaceId) as any[];
+    } else if (numLeads && numLeads > 0) {
+      const targetPlatform = platform === 'messenger' ? 'facebook' : platform;
+      targetLeads = db.prepare(`
+        SELECT id, value, display_name, lead_type 
+        FROM spam_leads 
+        WHERE (platform = ? OR (platform = 'social' AND ? = 'facebook')) 
+          AND status = 'pending' AND workspace_id = ?
+        ORDER BY id ASC 
+        LIMIT ?
+      `).all(targetPlatform, targetPlatform, workspaceId, numLeads) as any[];
+    }
+
+    // Với các chiến dịch comment hoặc message/inbox, bắt buộc phải có mục tiêu (Leads)
+    if (targetLeads.length === 0 && campaignType !== 'post') {
+      return NextResponse.json({ 
+        success: false, 
+        error: `Không tìm thấy mục tiêu (Leads) sẵn sàng nào cho nền tảng ${platform.toUpperCase()}. Vui lòng chọn hoặc nạp thêm Leads.` 
+      }, { status: 400 });
+    }
+
+    // 2. Xác định loại tác vụ chuẩn cho worker
+    const resolveJobType = (plat: string, campType: string): string => {
+      const p = (plat || 'x').toLowerCase();
+      const t = (campType || 'comment').toLowerCase();
+      if (t === 'post') {
+        if (p === 'threads') return 'threads_post';
+        return 'post';
+      }
+      if (t === 'comment') return 'comment';
+      if (t === 'group_post') {
+        if (p === 'whatsapp') return 'whatsapp_group_post';
+        return 'post';
+      }
+      if (p === 'zalo') return 'zalo_message';
+      if (p === 'telegram') return 'telegram_message';
+      if (p === 'whatsapp') return 'whatsapp_message';
+      if (p === 'facebook' || p === 'messenger') return 'facebook_message';
+      return `${p}_message`;
+    };
+
+    const jobType = resolveJobType(platform, campaignType);
     const campaignId = `CAMP_${(platform || 'X').toUpperCase()}_${Date.now()}`;
     const baseStartTime = scheduledStart ? new Date(scheduledStart) : new Date();
+
+    // 3. Tính toán dãn cách an toàn cho từng tài khoản (Safety Level & Desired Duration)
+    const totalJobs = targetLeads.length > 0 ? targetLeads.length : accountIds.length;
+    const durationMinutes = Math.max(5, desiredDurationMinutes || 120);
+    const safeAccsCount = Math.max(1, accountIds.length);
+    const leadsPerAccount = Math.ceil(totalJobs / safeAccsCount);
+
+    const rawIntervalMs = leadsPerAccount > 1 
+      ? (durationMinutes * 60 * 1000) / (leadsPerAccount - 1)
+      : durationMinutes * 60 * 1000;
+
+    const minDelayMsBySafety: Record<string, number> = {
+      safe: 8 * 60 * 1000,     // An toàn: 8 phút/lần
+      balanced: 4 * 60 * 1000, // Cân bằng: 4 phút/lần
+      fast: 2 * 60 * 1000,     // Nhanh: 2 phút/lần
+    };
+    const minSafeIntervalMs = minDelayMsBySafety[safetyLevel] || (4 * 60 * 1000);
+    const accountIntervalMs = Math.max(minSafeIntervalMs, rawIntervalMs);
 
     const insertJobStmt = db.prepare(`
       INSERT INTO jobs (account_id, type, target_url, post_content, scheduled_at, status, campaign_id, workspace_id)
       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
     `);
 
+    const markLeadScheduledStmt = db.prepare(`
+      UPDATE spam_leads 
+      SET status = 'scheduled', last_attempt = CURRENT_TIMESTAMP 
+      WHERE id = ?
+    `);
+
     let jobCount = 0;
     const insertCampaignTx = db.transaction(() => {
-      for (let i = 0; i < accountIds.length; i++) {
-        const accountId = parseInt(accountIds[i], 10);
+      for (let i = 0; i < totalJobs; i++) {
+        const accIdx = i % accountIds.length;
+        const accountId = parseInt(accountIds[accIdx], 10);
+        const k = Math.floor(i / accountIds.length); // Job thứ k của tài khoản này
+
+        // Dãn cách tài khoản chéo nhau: Acc 0 -> 0s, Acc 1 -> 30s, Acc 2 -> 60s
+        const accStaggerOffset = accIdx * 30000 + Math.floor(Math.random() * 8000);
+        const scheduledTime = new Date(baseStartTime.getTime() + accStaggerOffset + (k * accountIntervalMs) + Math.floor(Math.random() * 10000));
+
+        const lead = targetLeads.length > 0 ? targetLeads[i] : null;
+        const targetUrl = lead ? lead.value : null;
+
+        // Merge tags cá nhân hóa: {name}, {displayName}, {uid}, {phone}
+        const placeholders = lead ? {
+          name: lead.display_name || 'bạn',
+          displayName: lead.display_name || 'bạn',
+          uid: lead.value || '',
+          phone: lead.value || '',
+          platform: platform || 'social',
+        } : undefined;
+
         const template = templates[i % templates.length];
-        const spunContent = parseSpintax(template.content);
-        const scheduledTime = new Date(baseStartTime.getTime() + i * 15000);
+        const spunContent = parseSpintax(template.content, placeholders);
 
         insertJobStmt.run(
           accountId,
-          campaignType === 'comment' ? 'comment' : 'post',
-          null,
+          jobType,
+          targetUrl,
           spunContent,
           scheduledTime.toISOString(),
           campaignId,
           workspaceId
         );
         jobCount++;
+
+        if (lead && lead.id) {
+          markLeadScheduledStmt.run(lead.id);
+        }
       }
     });
 
@@ -98,7 +205,8 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
-      message: `Khởi tạo chiến dịch thành công! Đã lên lịch ${jobCount} tác vụ.`
+      message: `Khởi tạo chiến dịch thành công! Đã lên lịch ${jobCount} tác vụ cho ${accountIds.length} tài khoản, dãn cách an toàn ~${Math.round(accountIntervalMs / 60000)} phút/lần.`,
+      data: { campaignId, totalJobs: jobCount, accountIntervalMinutes: Math.round(accountIntervalMs / 60000) }
     });
   } catch (error: any) {
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });

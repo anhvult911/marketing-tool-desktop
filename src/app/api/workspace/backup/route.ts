@@ -106,12 +106,19 @@ export async function POST(request: NextRequest) {
       fs.mkdirSync(PROFILES_DIR, { recursive: true });
     }
 
+    const safeBaseDir = path.resolve(PROFILES_DIR);
+
     for (const entry of zipEntries) {
       if (entry.entryName.startsWith('profiles/') && !entry.isDirectory) {
         const relativePath = entry.entryName.replace(/^profiles\//, '');
-        const targetPath = path.join(/*turbopackIgnore: true*/ PROFILES_DIR, relativePath);
-        const targetDir = path.dirname(targetPath);
+        // Bảo vệ chống lỗ hổng Zip Slip (Path Traversal)
+        const targetPath = path.resolve(safeBaseDir, relativePath);
+        if (!targetPath.startsWith(safeBaseDir + path.sep)) {
+          console.warn(`[Security Alert] Phát hiện và chặn entry Zip Slip nguy hiểm: ${entry.entryName}`);
+          continue;
+        }
 
+        const targetDir = path.dirname(targetPath);
         if (!fs.existsSync(targetDir)) {
           fs.mkdirSync(targetDir, { recursive: true });
         }

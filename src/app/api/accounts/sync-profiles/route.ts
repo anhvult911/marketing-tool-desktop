@@ -2,18 +2,19 @@ import { NextRequest, NextResponse } from 'next/server';
 import path from 'path';
 import fs from 'fs';
 import AdmZip from 'adm-zip';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { PROFILES_DIR } from '@/lib/paths';
-
-const execAsync = promisify(exec);
+import { getAuthSession } from '@/lib/auth';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 // GET: Xuất (Download) toàn bộ thư mục profiles/ thành file profiles_backup.zip
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const session = await getAuthSession(req);
+    if (!session) {
+      return NextResponse.json({ success: false, error: 'Chưa đăng nhập.' }, { status: 401 });
+    }
     const profilesDir = PROFILES_DIR;
 
     if (!fs.existsSync(profilesDir)) {
@@ -70,6 +71,11 @@ export async function GET() {
 // POST: Nhập (Upload) file ZIP và giải nén trực tiếp vào thư mục profiles/
 export async function POST(req: NextRequest) {
   try {
+    const session = await getAuthSession(req);
+    if (!session) {
+      return NextResponse.json({ success: false, error: 'Chưa đăng nhập.' }, { status: 401 });
+    }
+
     const formData = await req.formData();
     const file = formData.get('file') as File | null;
 
@@ -98,16 +104,24 @@ export async function POST(req: NextRequest) {
       }, { status: 400 });
     }
 
-    // Giải nén đè vào thư mục profiles/
-    zip.extractAllTo(profilesDir, true);
+    const safeBaseDir = path.resolve(profilesDir);
 
-    // Phân quyền cho thư mục profiles trên Linux/macOS
-    if (process.platform !== 'win32') {
-      try {
-        await execAsync(`chmod -R 777 "${profilesDir}"`);
-      } catch (e: any) {
-        console.warn('[Sync-Profiles] Non-fatal chmod warning:', e.message);
+    // Giải nén từng entry có kiểm tra chống Zip Slip
+    for (const entry of zipEntries) {
+      if (entry.isDirectory) continue;
+
+      const targetPath = path.resolve(safeBaseDir, entry.entryName);
+      if (!targetPath.startsWith(safeBaseDir + path.sep)) {
+        console.warn(`[Security Alert] Chặn entry Zip Slip nguy hiểm trong sync-profiles: ${entry.entryName}`);
+        continue;
       }
+
+      const targetDir = path.dirname(targetPath);
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+      }
+
+      fs.writeFileSync(targetPath, entry.getData());
     }
 
     // Đếm số lượng thư mục profile sau khi giải nén

@@ -413,7 +413,7 @@ export default function ScrapeModal({ isOpen, onClose, accounts, campaigns, onSu
                       Chế độ Quét Toàn Diện Tối Đa (360° All-in-One Engine)
                     </div>
                     <div style={{ fontSize: '0.74rem', color: 'var(--text-secondary)' }}>
-                      Tự động gom tất cả: Người theo dõi + Cảm xúc (Like/Love/Care) + Bình luận & Trả lời + Nhóm liên kết Bio.
+                      Followers Cursor Engine (thu tối đa người theo dõi qua GraphQL phân trang) + Cảm xúc + Bình luận &amp; SĐT. Fanpage chặn follower list sẽ tự chuyển sang engager harvesting.
                     </div>
                   </div>
                 </div>

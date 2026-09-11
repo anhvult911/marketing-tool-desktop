@@ -1,8 +1,16 @@
 import { NextResponse } from 'next/server';
 import db from '@/lib/db';
-import { chromium } from 'playwright';
+import { chromium as baseChromium } from 'playwright';
+import { launchRobustPersistentContext } from '@/lib/browser-launcher';
 import { getAuthSession } from '@/lib/auth';
 import { killProfileProcesses, getLaunchOptions, parseCookiesToPlaywright, handleFacebookCheckpoints, checkLoginState as checkXLoginState } from '@/../worker/automation';
+
+const chromium = {
+  ...baseChromium,
+  launchPersistentContext: (userDataDir: string, options?: any) => {
+    return launchRobustPersistentContext(userDataDir, options);
+  },
+};
 
 const PLATFORM_DOMAINS: Record<string, { domain: string; url: string }> = {
   facebook: { domain: '.facebook.com', url: 'https://www.facebook.com/' },
@@ -84,27 +92,26 @@ export async function POST(request: Request) {
       try { await context.close(); } catch {}
     }
 
+    // Cookie mới nạp → luôn reset trạng thái: nếu validation fail cũng KHÔNG giữ 'die'
+    // vĩnh viễn (validate có thể fail do proxy/latency, không hẳn cookie hỏng).
+    // 'live' nếu validation pass; 'pending' để pre-flight của scraper re-probe sau.
+    db.prepare(`
+      UPDATE social_accounts
+      SET auth_token = ?, status = ?, last_checked = ?, cooldown_until = NULL,
+          daily_reset_at = CURRENT_TIMESTAMP, daily_request_count = 0
+      WHERE id = ?
+    `).run(rawCookies.trim(), isLive ? 'live' : 'pending', new Date().toISOString(), accountId);
+
     if (isLive) {
-      db.prepare(`
-        UPDATE social_accounts 
-        SET status = 'live', auth_token = ?, last_checked = ? 
-        WHERE id = ?
-      `).run(rawCookies.trim(), new Date().toISOString(), accountId);
-      return NextResponse.json({ 
-        success: true, 
-        message: `Đã nạp ${parsedCookies.length} cookies thành công! Tài khoản @${account.username} đã LIVE.` 
+      return NextResponse.json({
+        success: true,
+        message: `Đã nạp ${parsedCookies.length} cookies thành công! Tài khoản @${account.username} đã LIVE.`
       });
-    } else {
-      db.prepare(`
-        UPDATE social_accounts 
-        SET auth_token = ? 
-        WHERE id = ?
-      `).run(rawCookies.trim(), accountId);
-      return NextResponse.json({ 
-        success: false, 
-        error: 'Kiểm tra thất bại. Cookie có thể đã hết hạn.' 
-      }, { status: 400 });
     }
+    return NextResponse.json({
+      success: false,
+      error: 'Validate trực tiếp thất bại (có thể do proxy/latency) — cookie ĐÃ LƯU với status=pending, pre-flight của job scrape sẽ re-probe và tự khôi phục nếu cookie còn sống.'
+    }, { status: 400 });
   } catch (error: any) {
     return NextResponse.json({ success: false, error: error.message || 'Lỗi hệ thống.' }, { status: 500 });
   }

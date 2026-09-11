@@ -3,35 +3,9 @@ import db from '@/lib/db';
 import path from 'path';
 import { getAuthSession } from '@/lib/auth';
 import { PROFILES_DIR } from '@/lib/paths';
+import { parseProxyLine } from '@/lib/proxy-utils';
 
 const VALID_PLATFORMS = ['x', 'zalo', 'whatsapp', 'telegram', 'threads', 'facebook', 'youtube', 'tiktok', 'instagram', 'newf319'];
-
-function parseProxyString(line: string): { host: string; port: number; username?: string; password?: string } | null {
-  line = line.trim();
-  if (!line) return null;
-  if (line.includes('@')) {
-    const [auth, hostPort] = line.split('@');
-    if (!auth || !hostPort) return null;
-    const [username, password] = auth.split(':');
-    const [host, portStr] = hostPort.split(':');
-    const port = parseInt(portStr, 10);
-    if (host && !isNaN(port)) {
-      return { host, port, username: username || undefined, password: password || undefined };
-    }
-  } else {
-    const parts = line.split(':');
-    if (parts.length >= 2) {
-      const host = parts[0];
-      const port = parseInt(parts[1], 10);
-      const username = parts[2] || undefined;
-      const password = parts[3] || undefined;
-      if (host && !isNaN(port)) {
-        return { host, port, username, password };
-      }
-    }
-  }
-  return null;
-}
 
 export async function GET(request: Request) {
   try {
@@ -120,7 +94,7 @@ export async function POST(request: Request) {
             if (/^\d+$/.test(proxyPart)) {
               proxyId = parseInt(proxyPart, 10);
             } else {
-              const parsedProxy = parseProxyString(proxyPart);
+              const parsedProxy = parseProxyLine(proxyPart);
               if (parsedProxy) {
                 const existing = findProxyStmt.get(parsedProxy.host, parsedProxy.port, workspaceId) as any;
                 if (existing) {

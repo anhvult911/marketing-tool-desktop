@@ -104,7 +104,10 @@ export default function AccountsPage() {
 
   const handleImportProxies = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!rawProxies.trim()) return;
+    if (!rawProxies || !rawProxies.trim()) {
+      setMessage({ text: 'Vui lòng dán danh sách proxy vào ô văn bản trước khi bấm Nhập.', type: 'error' });
+      return;
+    }
     setLoading(true);
     setMessage(null);
     try {
@@ -119,7 +122,7 @@ export default function AccountsPage() {
         setRawProxies('');
         fetchData();
       } else {
-        setMessage({ text: data.error, type: 'error' });
+        setMessage({ text: data.error || 'Lỗi khi nhập proxy.', type: 'error' });
       }
     } catch (err: any) {
       setMessage({ text: err.message, type: 'error' });
@@ -130,7 +133,10 @@ export default function AccountsPage() {
 
   const handleImportAccounts = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!rawAccounts.trim()) return;
+    if (!rawAccounts || !rawAccounts.trim()) {
+      setMessage({ text: 'Vui lòng dán danh sách tài khoản vào ô văn bản trước khi bấm Nhập.', type: 'error' });
+      return;
+    }
     setLoading(true);
     setMessage(null);
     try {
@@ -664,10 +670,11 @@ export default function AccountsPage() {
                     ? "telegram_user|MậtKhẩu123|tele_mail@gmail.com|192.168.1.100:8080"
                     : "username|password|email|proxy"
                 }
+                onInput={(e) => setRawAccounts((e.target as HTMLTextAreaElement).value)}
                 style={{ minHeight: '120px' }}
               />
             </div>
-            <button className="btn btn-primary" type="submit" disabled={loading || !rawAccounts.trim()}>
+            <button className="btn btn-primary" type="submit" disabled={loading}>
               {loading ? 'Đang xử lý...' : '📥 Nhập tài khoản'}
             </button>
           </form>
@@ -685,11 +692,12 @@ export default function AccountsPage() {
                 className="textarea"
                 value={rawProxies}
                 onChange={(e) => setRawProxies(e.target.value)}
+                onInput={(e) => setRawProxies((e.target as HTMLTextAreaElement).value)}
                 placeholder="192.168.1.1:8080&#10;192.168.1.2:8080:username:password"
                 style={{ minHeight: '120px' }}
               />
             </div>
-            <button className="btn btn-primary" type="submit" disabled={loading || !rawProxies.trim()}>
+            <button className="btn btn-primary" type="submit" disabled={loading}>
               {loading ? 'Đang xử lý...' : '🌐 Nhập Proxy'}
             </button>
           </form>

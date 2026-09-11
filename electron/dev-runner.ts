@@ -3,7 +3,7 @@ import http from 'http';
 
 function checkNextDevReady(): Promise<boolean> {
   return new Promise((resolve) => {
-    const req = http.get('http://localhost:3000', (res) => {
+    const req = http.get('http://127.0.0.1:3000', (res) => {
       resolve(res.statusCode !== undefined);
     });
     req.on('error', () => {
@@ -13,7 +13,7 @@ function checkNextDevReady(): Promise<boolean> {
 }
 
 async function start() {
-  console.log('⏳ Waiting for Next.js dev server at http://localhost:3000...');
+  console.log('⏳ Waiting for Next.js dev server at http://127.0.0.1:3000...');
   let ready = false;
   while (!ready) {
     ready = await checkNextDevReady();

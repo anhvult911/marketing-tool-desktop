@@ -72,4 +72,7 @@ export class ConcurrencyLimiter {
 
 // Mặc định cho phép tối đa 2 trình duyệt Playwright chạy đồng thời
 export const browserLimiter = new ConcurrencyLimiter(2);
+// Scrape jobs chạy dài (10-60 phút) — tách limiter riêng để không đói job post/comment
+// vốn cần slot browser nhanh. 2 scrape + 2 automation song song.
+export const scrapeLimiter = new ConcurrencyLimiter(2);
 export default browserLimiter;

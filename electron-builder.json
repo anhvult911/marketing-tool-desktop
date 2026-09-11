@@ -9,14 +9,15 @@
   },
   "files": [
     "dist-electron/**/*",
-    "dist-worker/**/*",
-    ".next/standalone/**/*",
-    "public/**/*",
+    "build/**/*",
     "package.json"
   ],
-  "asarUnpack": [
-    ".next/standalone/**/*",
-    "dist-worker/**/*"
+  "extraResources": [
+    {
+      "from": ".next/standalone",
+      "to": "standalone",
+      "filter": ["**/*"]
+    }
   ],
   "publish": {
     "provider": "github",

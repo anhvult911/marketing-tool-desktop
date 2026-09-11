@@ -4,7 +4,8 @@ import fs from 'fs';
 import db from './db';
 import { browserLimiter } from './concurrency';
 import { sendDesktopNotification } from './notify';
-import { unlockProfileDir } from './facebook-crawler';
+import { unlockProfileDir } from './profile-lock';
+import { launchRobustPersistentContext, launchRobustBrowser } from './browser-launcher';
 
 export interface TelegramScrapeOptions {
   jobId: number;
@@ -156,14 +157,14 @@ export async function runTelegramScrapeJob(options: TelegramScrapeOptions): Prom
       const launchArgs = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'];
 
       if (acc.user_data_dir && fs.existsSync(acc.user_data_dir)) {
-        context = await chromium.launchPersistentContext(acc.user_data_dir, {
+        context = await launchRobustPersistentContext(acc.user_data_dir, {
           headless: true,
           viewport: { width: 1366, height: 768 },
           proxy: proxyConfig,
           args: launchArgs,
         });
       } else {
-        const browser = await chromium.launch({ headless: true, proxy: proxyConfig, args: launchArgs });
+        const browser = await launchRobustBrowser({ headless: true, proxy: proxyConfig, args: launchArgs });
         context = await browser.newContext({ viewport: { width: 1366, height: 768 } });
       }
 

@@ -9,14 +9,24 @@ export async function GET(
   try {
     // Resolve params safely (handles both Next.js 14 sync and Next.js 15/16 async params)
     const resolvedParams = await params;
-    const filename = resolvedParams.filename;
+    // Bóc tách tên file an toàn bằng path.basename, loại trừ mọi path traversal (.., /, \)
+    const safeFilename = path.basename(resolvedParams.filename || '');
+    if (!safeFilename || safeFilename === '.' || safeFilename.includes('..')) {
+      return new Response('Tên tệp tin không hợp lệ.', { status: 400 });
+    }
     
-    let filePath = path.resolve(UPLOADS_DIR, filename);
+    const safeUploadsDir = path.resolve(UPLOADS_DIR);
+    let filePath = path.resolve(safeUploadsDir, safeFilename);
+
+    if (!filePath.startsWith(safeUploadsDir)) {
+      return new Response('Truy cập bị từ chối.', { status: 403 });
+    }
 
     if (!fs.existsSync(filePath)) {
       // Fallback kiểm tra thư mục public/uploads
-      const fallbackPath = path.resolve(process.cwd(), 'public', 'uploads', filename);
-      if (fs.existsSync(fallbackPath)) {
+      const safePublicDir = path.resolve(process.cwd(), 'public', 'uploads');
+      const fallbackPath = path.resolve(safePublicDir, safeFilename);
+      if (fallbackPath.startsWith(safePublicDir) && fs.existsSync(fallbackPath)) {
         filePath = fallbackPath;
       } else {
         return new Response('Không tìm thấy tệp tin.', { status: 404 });
@@ -27,7 +37,7 @@ export async function GET(
     
     // Determine the correct Content-Type based on file extension
     let contentType = 'application/octet-stream';
-    const ext = path.extname(filename).toLowerCase();
+    const ext = path.extname(safeFilename).toLowerCase();
     
     if (ext === '.png') contentType = 'image/png';
     else if (ext === '.jpg' || ext === '.jpeg') contentType = 'image/jpeg';

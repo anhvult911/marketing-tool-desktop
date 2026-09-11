@@ -6,14 +6,15 @@
   "author": "MKT Team",
   "private": true,
   "scripts": {
-    "dev:next": "next dev",
-    "dev:electron": "wait-on http://localhost:3000 && electron .",
-    "dev": "concurrently -n \"Next,Electron\" -c \"blue,yellow\" \"next dev\" \"tsx electron/dev-runner.ts\"",
+    "dev:next": "next dev -H 127.0.0.1 -p 3000",
+    "dev:electron": "wait-on http://127.0.0.1:3000 && electron .",
+    "dev": "concurrently -k -n \"Next,Electron\" -c \"blue,yellow\" \"next dev -H 127.0.0.1 -p 3000\" \"tsx electron/dev-runner.ts\"",
     "build:electron": "npx tsc -p tsconfig.electron.json",
     "build:worker": "npx tsc worker/worker.ts --outDir dist-worker --skipLibCheck --esModuleInterop --target ES2022 --module CommonJS",
-    "build:next": "next build && node electron/copy-assets.js",
+    "build:next": "npm rebuild better-sqlite3 && next build && npx @electron/rebuild -f -w better-sqlite3 && node electron/copy-assets.js",
     "build": "npm run build:electron && npm run build:worker && npm run build:next",
     "dist": "npm run build && electron-builder",
+    "rebuild:dev": "npm rebuild better-sqlite3",
     "lint": "eslint"
   },
   "dependencies": {
