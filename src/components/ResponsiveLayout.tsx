@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import Sidebar, { UserSession } from './Sidebar';
+import { UpdateToast, ForceUpdateModal, VersionPanel } from './UpdateManager';
 
 interface Workspace {
   id: number;
@@ -846,6 +847,10 @@ export default function ResponsiveLayout({ children }: { children: React.ReactNo
         </main>
       </div>
 
+      {/* CẬP NHẬT PHIÊN BẢN: banner có bản mới + popup bắt buộc cập nhật */}
+      <UpdateToast />
+      <ForceUpdateModal />
+
       {/* PROFILE SETTINGS MODAL */}
       {showProfileModal && user && (
         <div className="modal-overlay">
@@ -932,6 +937,14 @@ export default function ResponsiveLayout({ children }: { children: React.ReactNo
 
                 {(user.role === 'admin' || user.isSuperAdmin) && (
                   <>
+                    <hr style={{ border: 'none', borderTop: '1px solid rgba(255, 255, 255, 0.1)', margin: '20px 0' }} />
+                    <h4 style={{ fontSize: '14px', color: '#fff', marginBottom: '6px' }}>🔄 Phiên bản & Cập nhật ứng dụng</h4>
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginBottom: '12px' }}>
+                      Ứng dụng tự kiểm tra bản mới khi khởi động và mỗi 2 giờ. Khi bản hiện tại thấp hơn mức tối thiểu
+                      mà nhà phát hành yêu cầu, hệ thống sẽ yêu cầu cập nhật trước khi tiếp tục sử dụng.
+                    </p>
+                    <VersionPanel />
+
                     <hr style={{ border: 'none', borderTop: '1px solid rgba(255, 255, 255, 0.1)', margin: '20px 0' }} />
                     <h4 style={{ fontSize: '14px', color: '#fff', marginBottom: '10px' }}>🏢 Cấu hình Workspace (Chỉ dành cho Admin)</h4>
                     <div className="form-group">

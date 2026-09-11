@@ -53,6 +53,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Chạy trước khi build: test này kiểm tra update-policy.json hợp lệ VÀ các
+      # hằng số trong electron/update-policy.ts khớp electron-builder.json
+      # (owner/repo, releaseType, tên asset) — đúng loại lỗi đã làm hỏng feed v1.0.0.
+      - name: Run update policy tests
+        run: npx tsx scripts/test-update-policy.ts
+
       - name: Build Next.js and Electron
         run: npm run build
 
@@ -63,6 +69,18 @@ jobs:
         # electron-builder là DRAFT, mà electron-updater BỎ QUA draft hoàn toàn →
         # app đã cài sẽ không bao giờ thấy bản mới.
         run: npx electron-builder --win --publish always
+
+      # Asset chính sách phiên bản: app tải qua URL ổn định
+      # releases/latest/download/update-policy.json để biết bản tối thiểu bắt buộc.
+      # PHẢI upload SAU khi release tồn tại (electron-builder tạo release ở bước trên).
+      - name: Upload update policy asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "Upload update-policy.json vào release v${PKG_VERSION}..."
+          gh release upload "v${PKG_VERSION}" update-policy.json --clobber
 
       # Bắt buộc: electron-builder có thể "thành công" mà KHÔNG upload gì
       # (từng xảy ra: "skipped publishing ... publishingType=draft") → CI xanh
@@ -80,6 +98,7 @@ jobs:
           echo "Kiểm tra release v${PKG_VERSION}..."
           gh release view "v${PKG_VERSION}" --json isDraft,tagName,assets > release.json
           gh release download "v${PKG_VERSION}" --pattern latest.yml --dir ./release-feed --clobber
+          gh release download "v${PKG_VERSION}" --pattern update-policy.json --dir ./release-feed --clobber
           node -e '
             const fs = require("fs");
             const yaml = require("js-yaml");
@@ -93,6 +112,15 @@ jobs:
             if (!names.includes("latest.yml")) problems.push("thiếu latest.yml (feed cập nhật) — app không thể kiểm tra phiên bản");
             if (!names.some(n => n.endsWith(".exe"))) problems.push("thiếu file cài đặt .exe");
             if (!names.some(n => n.endsWith(".blockmap"))) problems.push("thiếu .blockmap (tải cập nhật từng phần)");
+            if (!names.includes("update-policy.json")) problems.push("thiếu update-policy.json — app không biết phiên bản tối thiểu bắt buộc");
+
+            if (names.includes("update-policy.json")) {
+              const rawPolicy = JSON.parse(fs.readFileSync("release-feed/update-policy.json", "utf8"));
+              console.log("policy:", JSON.stringify(rawPolicy));
+              const ver = (v) => typeof v === "string" && /^v?[0-9]+([.][0-9]+)*([.-][0-9A-Za-z.]+)?$/.test(v);
+              if (!ver(rawPolicy.minimumVersion || "0.0.0")) problems.push(`minimumVersion không hợp lệ: ${JSON.stringify(rawPolicy.minimumVersion)}`);
+              if (!ver(rawPolicy.recommendedVersion || "0.0.0")) problems.push(`recommendedVersion không hợp lệ: ${JSON.stringify(rawPolicy.recommendedVersion)}`);
+            }
 
             if (names.includes("latest.yml")) {
               const feed = yaml.load(fs.readFileSync("release-feed/latest.yml", "utf8"));
