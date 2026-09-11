@@ -1,95 +1,72 @@
 /**
- * Throwaway verification for ScrapeSessionPool (P1). Chạy: npx tsx scripts/test-scrape-pool.ts
- * Không phụ thuộc Playwright/DB — thuần logic scheduler.
+ * Unit test cho ScrapeAccountPool (P2) — trạng thái cooldown + circuit breaker.
+ * Chạy: npx tsx scripts/test-scrape-pool.ts
  */
-import { ScrapeSessionPool, poolWaitMs } from '../src/lib/scrape-pool';
+import { ScrapeAccountPool } from '../src/lib/scrape-pool';
 
-let passed = 0;
+let fail = 0;
 function check(name: string, cond: boolean, detail?: unknown) {
-  if (cond) { passed++; console.log(`  ✓ ${name}`); }
-  else { console.error(`  ✗ ${name}`, detail !== undefined ? detail : ''); process.exitCode = 1; }
+  if (cond) console.log(`  ✓ ${name}`);
+  else { console.error(`  ✗ ${name}`, detail !== undefined ? detail : ''); fail++; }
 }
 
-// ── Scene 1: N account, slots < N — song song đúng slot count ──
+// ── Cooldown: chain xong → nghỉ đúng thời lượng, hết nghỉ chạy lại ──
 {
-  const pool = new ScrapeSessionPool([1, 2, 3, 4], 2);
-  const t = 1000;
-  const a1 = pool.acquireNext({ now: t, passToken: 1 });
-  const a2 = pool.acquireNext({ now: t, passToken: 1 });
-  const a3 = pool.acquireNext({ now: t, passToken: 1 });
-  check('slot 1 cấp cho account đầu tiên', a1.granted && a1.accountId === 1, a1);
-  check('slot 2 cấp cho account kế', a2.granted && a2.accountId === 2, a2);
-  check('hết slot → từ chối', !a3.granted && a3.reason === 'all-slots-busy', a3);
-  check('busy track đúng 2 slot', pool.busyIds().join(',') === '1,2', pool.busyIds());
-
-  // Account 1 trả slot (productive) → phải nghỉ cooldown; account 3 vào ngay
-  pool.release(1, { now: t, cooldownMs: 600_000, unproductive: false });
-  const a4 = pool.acquireNext({ now: t, passToken: 1 });
-  check('account 3 nhận slot ngay khi 1 trả', a4.granted && a4.accountId === 3, a4);
-  check('account 1 không được cấp khi còn cooldown', !pool.getAccount(1)!.busy);
-
-  // Unproductive × 2 → exhausted per-account
-  pool.release(3, { now: t, cooldownMs: 0, unproductive: true, maxUnproductive: 2 });
-  pool.acquireNext({ now: t + 1000, passToken: 1 }); // cấp lại cho 3
-  pool.release(3, { now: t + 1000, cooldownMs: 0, unproductive: true, maxUnproductive: 2 });
-  check('account 3 exhausted sau 2 phiên 0 lead', pool.getAccount(3)!.exhausted === true);
-  const a5 = pool.acquireNext({ now: t + 2000, passToken: 1 });
-  check('account 4 nhận việc, 3 bị loại vĩnh viễn', a5.granted && a5.accountId === 4, a5);
+  const pool = new ScrapeAccountPool([1, 2]);
+  const t = 1_000_000;
+  check('khởi tạo: chạy được ngay', pool.canRun(1, t) && pool.canRun(2, t));
+  pool.noteChainDone(1, { now: t, cooldownMs: 600_000, unproductive: false });
+  check('sau chain: account 1 bị chặn bởi cooldown', !pool.canRun(1, t + 1));
+  check('cooldownRemaining ≈ 600s - 1ms', pool.cooldownRemaining(1, t + 1) === 599_999);
+  check('account 2 không bị ảnh hưởng', pool.canRun(2, t + 1));
+  check('hết cooldown → chạy lại được', pool.canRun(1, t + 600_001));
 }
 
-// ── Scene 2: cooldown toàn pool → waitMs báo đúng, hết nghỉ → cấp lại ──
+// ── Circuit breaker per-account: 2 chain 0 lead liên tiếp → exhausted ──
 {
-  const pool = new ScrapeSessionPool([10, 11], 4);
-  const t = 5000;
-  pool.acquireNext({ now: t, passToken: 1 });
-  pool.acquireNext({ now: t, passToken: 1 });
-  pool.release(10, { now: t, cooldownMs: 120_000, unproductive: false });
-  pool.release(11, { now: t, cooldownMs: 60_000, unproductive: false });
-  check('all-resting khi cả pool cooldown', pool.acquireNext({ now: t + 10_000, passToken: 2 }).reason === 'all-resting');
-  check('waitMs = 110s (cooldown dài nhất còn lại)', poolWaitMs(pool, t + 10_000) === 110_000, poolWaitMs(pool, t + 10_000));
-  const after = pool.acquireNext({ now: t + 70_000, passToken: 2 });
-  check('hết cooldown 60s → account 11 chạy tiếp', after.granted && after.accountId === 11, after);
-}
-
-// ── Scene 3: pass-token fairness — token xoay, idle account theo lượt ──
-{
-  const pool = new ScrapeSessionPool([20, 21], 1);
+  const pool = new ScrapeAccountPool([10, 11]);
   const t = 0;
-  // Pass 1: cả 2 nhận token 1; account 20 giữ slot duy nhất
-  const r1 = pool.acquireNext({ now: t, passToken: 1 });
-  check('pass 1: token 1 → account 20', r1.granted && r1.accountId === 20, r1);
-  // Token xoay trước nghỉ giữa pass (chỉ account rảnh không busy)
-  pool.release(20, { now: t, cooldownMs: 0, unproductive: false });
-  pool.rotatePassToken(); // idle cả 2 → token 2
-  const r2 = pool.acquireNext({ now: t + 1, passToken: 2 });
-  check('pass 2: token 2 → account 20 (re-ready đầu)', r2.granted && r2.accountId === 20, r2);
-  // Giữ 20 busy, xoay lượt cho 21: rotate chỉ nâng token account rảnh
-  pool.rotatePassToken(); // 21 (idle) → token 3; 20 busy giữ token 2
-  pool.release(20, { now: t + 2, cooldownMs: 0, unproductive: false });
-  const r3 = pool.acquireNext({ now: t + 3, passToken: 3 });
-  check('lượt sau xoay về account 21 đúng token', r3.granted && r3.accountId === 21, r3);
+  pool.noteChainDone(10, { now: t, cooldownMs: 0, unproductive: true, maxUnproductive: 2 });
+  check('1 chain 0 lead: chưa cháy', !pool.get(10)!.exhausted && pool.canRun(10, t));
+  pool.noteChainDone(10, { now: t, cooldownMs: 0, unproductive: true, maxUnproductive: 2 });
+  check('2 chain 0 lead: cháy circuit', pool.get(10)!.exhausted);
+  check('cháy circuit → không chạy lại dù hết cooldown', !pool.canRun(10, t + 999_999_999));
+  const healed = new ScrapeAccountPool([20]);
+  healed.noteChainDone(20, { now: 0, cooldownMs: 0, unproductive: true, maxUnproductive: 2 });
+  healed.noteChainDone(20, { now: 0, cooldownMs: 0, unproductive: false, maxUnproductive: 2 });
+  healed.noteChainDone(20, { now: 0, cooldownMs: 0, unproductive: true, maxUnproductive: 2 });
+  check('chain có lead ở giữa → reset đếm, không cháy', !healed.get(20)!.exhausted);
 }
 
-// ── Scene 4: toàn pool exhausted → isAlive false, acquire từ chối vĩnh viễn ──
+// ── isAlive: job sống khi còn account chưa cháy ──
 {
-  const pool = new ScrapeSessionPool([30], 2);
-  pool.acquireNext({ now: 0, passToken: 1 });
-  pool.release(30, { now: 0, cooldownMs: 0, unproductive: true, maxUnproductive: 1 });
-  check('exhausted toàn pool → isAlive false', pool.isAlive() === false);
-  const r = pool.acquireNext({ now: 999_999, passToken: 5 });
-  check('acquire sau exhaust → all-exhausted', !r.granted && r.reason === 'all-exhausted', r);
-  pool.skipRests();
-  check('skipRests không hồi sinh exhausted', !pool.isAlive() && !pool.acquireNext({ now: 1e9, passToken: 1 }).granted);
+  const pool = new ScrapeAccountPool([30, 31]);
+  const t = 0;
+  pool.noteChainDone(30, { now: t, cooldownMs: 1000, unproductive: false });
+  pool.noteChainDone(31, { now: t, cooldownMs: 2000, unproductive: false });
+  check('vẫn sống (job chờ, không kết thúc)', pool.isAlive());
+  pool.markExhausted(30);
+  pool.markExhausted(31);
+  check('loại hết account → isAlive false', !pool.isAlive());
+  check('exhaustedCount đúng', pool.exhaustedCount() === 2);
 }
 
-// ── Scene 5: account riêng bị markExhausted (checkpoint) không chặn pool ──
+// ── markExhausted nhả cooldown (checkpoint xử lý ngay, không chờ) ──
 {
-  const pool = new ScrapeSessionPool([40, 41], 2);
-  pool.acquireNext({ now: 0, passToken: 1 }); // 40 giữ slot
-  pool.markExhausted(41);
-  check('pool vẫn sống khi 1 account checkpoint', pool.isAlive() === true);
+  const pool = new ScrapeAccountPool([40]);
+  pool.noteChainDone(40, { now: 0, cooldownMs: 3_600_000, unproductive: false });
   pool.markExhausted(40);
-  check('checkpoint account đang giữ slot → nhả slot, pool chết', !pool.isAlive() && pool.busyIds().length === 0);
+  check('markExhausted xoá cooldown + đánh dấu cháy',
+    pool.get(40)!.exhausted && pool.cooldownRemaining(40, 0) === 0);
 }
 
-console.log(process.exitCode ? `\n❌ FAILED` : `\n✓ PASSED (${passed} checks)`);
+// ── chains counter ──
+{
+  const pool = new ScrapeAccountPool([50]);
+  pool.noteChainDone(50, { now: 0, cooldownMs: 0, unproductive: false });
+  pool.noteChainDone(50, { now: 1, cooldownMs: 0, unproductive: false });
+  check('chains đếm đúng 2', pool.get(50)!.chains === 2);
+}
+
+console.log(fail === 0 ? '\n✓ ACCOUNT POOL PASSED' : `\n✗ ACCOUNT POOL FAILED (${fail})`);
+process.exit(fail === 0 ? 0 : 1);

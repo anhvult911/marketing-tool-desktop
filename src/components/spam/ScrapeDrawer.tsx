@@ -670,7 +670,7 @@ export default function ScrapeDrawer({ isOpen, onClose, accounts, campaigns, onS
                         Chế độ Quét Toàn Diện Tối Đa (360° All-in-One Multi-Vector)
                       </div>
                       <div style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', lineHeight: '1.3' }}>
-                        Tự động bóc tách toàn diện: <strong>Followers Cursor Engine (thu tối đa người theo dõi qua GraphQL phân trang) + Cảm xúc + Bình luận &amp; SĐT</strong> từ Fanpage / Profile / Nhóm mục tiêu. Fanpage chặn follower list sẽ tự chuyển sang engager harvesting.
+                        Chạy <strong>song song nhiều kênh trên cùng target</strong>: Followers Cursor Engine (GraphQL phân trang) + <strong>Bạn bè công khai</strong> + Reaction &amp; Bình luận từng bài (mbasic) + bóc <strong>SĐT/Zalo</strong> từ nội dung. Fanpage chặn follower list tự chuyển engager harvesting.
                       </div>
                     </div>
                   </div>

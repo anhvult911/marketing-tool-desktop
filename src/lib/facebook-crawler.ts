@@ -2,8 +2,10 @@ import { chromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import db, { getSetting } from './db';
-import { scrapeLimiter } from './concurrency';
-import { ScrapeSessionPool, poolWaitMs } from './scrape-pool';
+import { scrapeLimiter, ConcurrencyLimiter } from './concurrency';
+import { ScrapeAccountPool } from './scrape-pool';
+import { ScrapeTaskBoard } from './scrape-tasks';
+import type { ClaimedTask } from './scrape-tasks';
 import { sendDesktopNotification } from './notify';
 import { launchRobustPersistentContext, launchRobustBrowser } from './browser-launcher';
 import { unlockProfileDir, killProfileProcesses } from './profile-lock';
@@ -336,6 +338,27 @@ export function extractVietnamesePhones(text: string): string[] {
 }
 
 /**
+ * P2 — Bóc SĐT trực tiếp từ HTML mbasic (reaction/comment/timeline/member pages).
+ * Mỗi SĐT là 1 lead zalo độc lập (uid rỗng, saveLeadBatch xử lý nhánh phone-only).
+ * Trang mbasic là HTML thuần nên text bình luận/bài viết nằm ngay trong markup.
+ */
+function harvestPhonesFromHtml(
+  html: string,
+  saveBatch: (leads: ExtractedLead[]) => number
+): number {
+  if (!html) return 0;
+  const text = html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
+  const phones = extractVietnamesePhones(text);
+  if (phones.length === 0) return 0;
+  return saveBatch(phones.map(p => ({
+    uid: '',
+    displayName: `SĐT từ bình luận/bài viết`,
+    interactionType: 'phone_comment',
+    phone: p,
+  })));
+}
+
+/**
  * Check if the current page has hit Facebook Checkpoint, Lock or Temporary Block
  */
 export function detectFacebookCheckpoint(url: string, pageContent: string): boolean {
@@ -638,18 +661,19 @@ async function extractGroupMembersFromDOM(
 }
 
 /**
- * Quét danh sách người theo dõi (Followers) của Fanpage hoặc Profile (/followers)
+ * Quét danh sách người công khai từ DOM: /followers (fanpage/profile) hoặc
+ * /friends (profile để bạn bè công khai). P2 — dùng chung cho 2 kênh.
  */
-async function extractFollowersFromDOM(
+async function extractPeopleListFromDOM(
   page: Page,
-  cleanUrl: string,
+  listUrl: string,
+  interactionType: 'follower' | 'friend',
   saveBatch: (leads: ExtractedLead[]) => number,
   maxLimit: number,
   cancelSignal: { cancelled: boolean }
 ): Promise<number> {
-  const followersUrl = `${cleanUrl.replace(/\/$/, '')}/followers`;
-  console.log(`[FB Scraper] 🌟 Kiểm tra danh sách người theo dõi tại: ${followersUrl}`);
-  await page.goto(followersUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
+  console.log(`[FB Scraper] 🌟 Kiểm tra danh sách (${interactionType}) tại: ${listUrl}`);
+  await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
   await page.waitForTimeout(2500);
   await dismissFacebookDialogs(page);
 
@@ -667,7 +691,7 @@ async function extractFollowersFromDOM(
   });
 
   if (isRecommendedPages) {
-    console.log(`[FB Scraper] ⚠️ Tab /followers hiển thị danh sách trang đề xuất thay vì người theo dõi cá nhân. Bỏ qua để chuyển sang cào tương tác bài viết.`);
+    console.log(`[FB Scraper] ⚠️ Tab ${listUrl} hiển thị danh sách trang đề xuất thay vì người thật. Bỏ qua.`);
     return 0;
   }
 
@@ -735,7 +759,7 @@ async function extractFollowersFromDOM(
           displayName: f.name,
           avatarUrl: f.avatar || undefined,
           profileUrl: f.href.startsWith('http') ? f.href : `https://www.facebook.com${f.href}`,
-          interactionType: 'follower'
+          interactionType
         });
       }
     }
@@ -750,7 +774,7 @@ async function extractFollowersFromDOM(
       scrollAttempts++;
       stagnantScrolls++;
       if (scrollAttempts >= 3 && totalScraped === 0) {
-        console.log(`[FB Scraper] Tab Followers không có dữ liệu công khai hoặc bị ẩn.`);
+        console.log(`[FB Scraper] Danh sách ${listUrl} không có dữ liệu công khai hoặc bị ẩn.`);
         break;
       }
     }
@@ -1445,11 +1469,39 @@ export function parseMbasicReactionPage(html: string): {
     }
   }
 
-  // 2. Bóc tách profile anchor
+  // 2. Bóc tách profile anchor (dùng chung với parser trang comment)
+  leads.push(...parseMbasicUserAnchors(html));
+
+  return { leads, nextPageUrl };
+}
+
+/**
+ * P2 — Bóc tách profile anchor từ HTML mbasic bất kỳ (reaction browser, comment
+ * page, story page). Tách riêng để trang comment tái dùng đúng ngữ nghĩa lọc
+ * (loại link hệ thống/bài viết, giữ link người thật) đã kiểm chứng ở reaction.
+ */
+function parseMbasicUserAnchors(html: string): Array<{ uid: string; displayName: string }> {
+  const leads: Array<{ uid: string; displayName: string }> = [];
+  if (!html) return leads;
+
+  const skipKeywords = [
+    'ufi', 'reaction', 'reactions', 'groups', 'messages', 'notifications', 'friends', 'marketplace', 'watch',
+    'events', 'saved', 'pages', 'ads', 'policies', 'help', 'login', 'recover', 'settings',
+    'privacy', 'terms', 'photo.php', 'video.php', 'story.php', 'home.php', 'menu', 'bug', 'r.php',
+    'hashtag', 'hashtags', 'places', 'location', 'allactivity', 'browse', 'search', 'sharer.php', 'mbasic',
+    'profile_picture', 'comment', 'share', 'permalink', 'about', 'feed'
+  ];
+
+  const skipTextKeywords = [
+    'xem thêm', 'see more', 'tất cả', 'thích', 'yêu thích', 'haha', 'wow', 'buồn', 'phẫn nộ', 'thương thương',
+    'like', 'love', 'care', 'sad', 'angry', 'bình luận', 'chia sẻ', 'báo cáo', 'quay lại', 'trang chủ', 'menu',
+    'đăng nhập', 'tin nhắn', 'thông báo', 'bạn bè', 'cài đặt', 'xem trước', 'tìm kiếm', 'trả lời', 'reply'
+  ];
+
   const anchorMatches = Array.from(html.matchAll(/<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi));
   for (const match of anchorMatches) {
-    let href = match[1]?.replace(/&amp;/g, '&') || '';
-    let text = match[2]?.replace(/<[^>]+>/g, '').trim() || '';
+    const href = match[1]?.replace(/&amp;/g, '&') || '';
+    const text = match[2]?.replace(/<[^>]+>/g, '').trim() || '';
 
     if (!href || href.startsWith('#') || !text || text.length < 2 || text.length > 50 || text.includes('\n')) continue;
     if (text.startsWith('#')) continue;
@@ -1474,8 +1526,6 @@ export function parseMbasicReactionPage(html: string): {
       const peopleMatch = href.match(/\/people\/[^\/]+\/(\d+)/);
       if (peopleMatch) uid = peopleMatch[1];
     } else if (href.includes('/user/')) {
-      // Link dạng /user/<numeric-id> của account mới (chuẩn mbasic hiện tại) —
-      // thiếu nhánh này làm mất toàn bộ user có link /user/ từ reaction browser
       const userMatch = href.match(/\/user\/(\d{6,20})/);
       if (userMatch) uid = userMatch[1];
     } else {
@@ -1490,6 +1540,36 @@ export function parseMbasicReactionPage(html: string): {
 
     if (uid && !skipKeywords.includes(uid.toLowerCase()) && !/^\d{1,4}$/.test(uid)) {
       leads.push({ uid, displayName: text });
+    }
+  }
+
+  return leads;
+}
+
+/**
+ * P2 — Parse trang comment mbasic (story.php) — bóc người bình luận + link phân
+ * trang. Trang comment dùng chung cấu trúc anchor người dùng với reaction browser.
+ */
+export function parseMbasicCommentPage(html: string): {
+  leads: Array<{ uid: string; displayName: string }>;
+  nextPageUrl: string | null;
+} {
+  const leads = parseMbasicUserAnchors(html);
+  let nextPageUrl: string | null = null;
+  if (!html) return { leads, nextPageUrl };
+
+  // Link phân trang comment: story.php kèm cursor/after hoặc nhãn "xem thêm bình luận"
+  const anchorMatches = Array.from(html.matchAll(/<a\s+[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi));
+  for (const m of anchorMatches) {
+    const rawHref = m[1]?.replace(/&amp;/g, '&') || '';
+    const linkText = (m[2] || '').replace(/<[^>]+>/g, '').trim().toLowerCase();
+    const isCommentPaging = /story\.php\?[^"]*(cursor|after|comment_id|pagination)=/i.test(rawHref) &&
+      !rawHref.includes('/ufi/reaction/');
+    const isMoreText = linkText.includes('xem thêm bình luận') || linkText.includes('xem các bình luận trước') ||
+      linkText.includes('xem bình luận trước') || linkText.includes('see more comments') || linkText.includes('view more comments');
+    if (isCommentPaging || isMoreText) {
+      nextPageUrl = rawHref.startsWith('http') ? rawHref : `https://mbasic.facebook.com${rawHref.startsWith('/') ? '' : '/'}${rawHref}`;
+      break;
     }
   }
 
@@ -1550,6 +1630,9 @@ async function scrapeMbasicReactionsForPost(
         // Chỉ đếm lead insert MỚI — dedup thực hiện ở saveBatch (dedup tại trung tâm)
         addedCount += saveBatch(batch);
 
+        // P2 — bóc SĐT trong text trang reaction (bài viết/nội dung kèm) — lead zalo
+        addedCount += harvestPhonesFromHtml(html, saveBatch);
+
         if (addedCount === sizeBefore) {
           stagnantPages++;
         } else {
@@ -1578,6 +1661,70 @@ async function scrapeMbasicReactionsForPost(
 }
 
 /**
+ * P2 — Thu hoạch NGƯỜI BÌNH LUẬN của 1 bài viết qua mbasic story.php.
+ * Bổ sung cho reaction harvester: reactors và commenters là 2 tập người khác nhau,
+ * hợp lại tăng đáng kể unique leads/bài. Bóc kèm SĐT trong text bình luận.
+ */
+async function scrapeMbasicCommentersForPost(
+  page: Page,
+  postId: string,
+  maxLeads: number,
+  saveBatch: (leads: ExtractedLead[]) => number,
+  requestBudget: { remaining: number; onSpend?: () => void } | null = null
+): Promise<number> {
+  let addedCount = 0;
+  let stagnantPages = 0;
+
+  let currentUrl: string | null = `https://mbasic.facebook.com/story.php?story_fbid=${postId}`;
+  let pageNum = 1;
+
+  while (currentUrl && addedCount < maxLeads && pageNum <= 40 && stagnantPages < 3) {
+    if (page.isClosed()) break;
+    if (requestBudget && requestBudget.remaining <= 0) break;
+    if (requestBudget) requestBudget.remaining--;
+
+    try {
+      const sizeBefore = addedCount;
+      await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
+      const html = await page.content().catch(() => '');
+
+      if (!html || html.includes('checkpoint') || html.includes('login_form')) {
+        console.warn(`[Mbasic Comment] Checkpoint / yêu cầu đăng nhập ở trang ${pageNum} bài ${postId}`);
+        break;
+      }
+
+      const parsed = parseMbasicCommentPage(html);
+      const batch: ExtractedLead[] = parsed.leads.map(item => ({
+        uid: item.uid,
+        displayName: item.displayName,
+        profileUrl: `https://www.facebook.com/${item.uid}`,
+        interactionType: 'comment'
+      }));
+
+      addedCount += saveBatch(batch);
+      addedCount += harvestPhonesFromHtml(html, saveBatch);
+
+      if (addedCount === sizeBefore) stagnantPages++;
+      else stagnantPages = 0;
+
+      currentUrl = parsed.nextPageUrl;
+      pageNum++;
+
+      await page.waitForTimeout(1300 + Math.floor(Math.random() * 1200));
+      if (pageNum % 10 === 0) {
+        await page.waitForTimeout(6000 + Math.floor(Math.random() * 6000));
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[Mbasic Comment] Lỗi bài ${postId} trang ${pageNum}:`, msg);
+      break;
+    }
+  }
+
+  return addedCount;
+}
+
+/**
  * P1 — Khám phá Post ID từ timeline mbasic (bước 1 của engager sharding).
  * Pool session chia nhau danh sách post này để thu reaction — mỗi account xử lý
  * các bài khác nhau qua atomic pop, không quét lại timeline.
@@ -1586,6 +1733,7 @@ async function discoverMbasicPostIds(
   page: Page,
   targetUrlOrSlug: string,
   maxPosts: number,
+  saveBatch: (leads: ExtractedLead[]) => number,
   requestBudget: { remaining: number; onSpend?: () => void } | null = null
 ): Promise<string[]> {
   console.log(`[Mbasic Engager] 🚀 Khám phá timeline ${targetUrlOrSlug} (tối đa ${maxPosts} bài)...`);
@@ -1614,6 +1762,9 @@ async function discoverMbasicPostIds(
       for (const m of Array.from(html.matchAll(/story\.php\?[^"]*story_fbid=(\d{8,25})/gi))) {
         if (m[1]) discoveredPostIds.add(m[1]);
       }
+
+      // P2 — bài viết trên timeline thường chứa SĐT trong nội dung → lead zalo
+      harvestPhonesFromHtml(html, saveBatch);
 
       // Link phân trang timeline: sưu tầm MỌI anchor chứa cursor phân trang
       let nextTimelineUrl: string | null = null;
@@ -1647,16 +1798,19 @@ async function discoverMbasicPostIds(
 }
 
 /**
- * Cào thành viên nhóm qua mbasic.facebook.com (miễn nhiễm GraphQL throttle & React Virtual DOM)
+ * Cào thành viên nhóm qua mbasic.facebook.com (miễn nhiễm GraphQL throttle & React Virtual DOM).
+ * P2 — nhận `startUrl` để RESUME phân trang từ chain trước (account khác tiếp tục
+ * đúng trang thay vì quét lại từ đầu — tránh đốt request vào member đã thu).
  */
 async function scrapeGroupMembersViaMbasic(
   page: Page,
   targetGroup: string,
   maxLeads: number,
   saveBatch: (leads: ExtractedLead[]) => number,
-  requestBudget: { remaining: number; onSpend?: () => void } | null = null
-): Promise<number> {
-  console.log(`[Mbasic Group Harvester] 🚀 Khởi động bộ cào mbasic cho ${targetGroup}...`);
+  requestBudget: { remaining: number; onSpend?: () => void } | null = null,
+  startUrl?: string | null
+): Promise<{ added: number; nextUrl: string | null }> {
+  console.log(`[Mbasic Group Harvester] 🚀 Khởi động bộ cào mbasic cho ${targetGroup}${startUrl ? ' (resume từ trang đã lưu)' : ''}...`);
 
   const targetClean = targetGroup.trim().replace(/\/$/, '');
   let targetId = '';
@@ -1673,9 +1827,9 @@ async function scrapeGroupMembersViaMbasic(
     }
   }
 
-  let currentUrl: string | null = targetId
+  let currentUrl: string | null = startUrl || (targetId
     ? `https://mbasic.facebook.com/groups/${targetId}/members/`
-    : targetClean.replace(/^(https?:\/\/)?(www\.|m\.)?facebook\.com\//, 'https://mbasic.facebook.com/').replace(/\/$/, '') + '/members/';
+    : targetClean.replace(/^(https?:\/\/)?(www\.|m\.)?facebook\.com\//, 'https://mbasic.facebook.com/').replace(/\/$/, '') + '/members/');
 
   let pageNum = 1;
   let addedCount = 0;
@@ -1758,6 +1912,8 @@ async function scrapeGroupMembersViaMbasic(
 
       // Đếm theo số lead insert MỚI (dedup ở saveBatch) — anchor lặp giữa các trang không đốt quota
       addedCount += saveBatch(batch);
+      // P2 — SĐT trong bài đăng/bio hiển thị trên trang thành viên
+      addedCount += harvestPhonesFromHtml(html, saveBatch);
 
       const newFound = addedCount - sizeBefore;
       console.log(`[Mbasic Group Harvester] Trang ${pageNum}: +${newFound} leads (Tổng: ${addedCount}/${maxLeads})...`);
@@ -1795,8 +1951,8 @@ async function scrapeGroupMembersViaMbasic(
     }
   }
 
-  console.log(`[Mbasic Group Harvester] Hoàn tất! Đã thêm +${addedCount} leads qua mbasic.`);
-  return addedCount;
+  console.log(`[Mbasic Group Harvester] Hoàn tất! Đã thêm +${addedCount} leads qua mbasic (nextUrl: ${currentUrl ? 'có' : 'hết'}).`);
+  return { added: addedCount, nextUrl: currentUrl };
 }
 /**
  * Trích xuất Post ID số trực tiếp từ URL mẫu fbid, story_fbid, /posts/ID, /reel/ID...
@@ -2141,15 +2297,17 @@ export async function harvestFollowersPassive(
 
 
 /**
- * P1 — PARALLEL SESSION POOL JOB (thay Multi-Account Rotation tuần tự).
+ * P1+P2 — PARALLEL SESSION POOL JOB (thay Multi-Account Rotation tuần tự).
  *
- * - N account chạy ĐỒNG THỜI, bounded bởi setting `max_scrape_sessions` (RAM-safe).
- * - ScrapeSessionPool cấp slot; account worker lặp chain: chạy → nghỉ cooldown
- *   (slot nhả cho account khác) → chạy tiếp tới đủ maxLimit.
- * - Target lock: 1 account giữ 1 target; cursor target lưu DB (last_cursor +
- *   resume_target_idx) để account kế tiếp resume đúng vị trí — cơ chế CD đã chứng minh.
- * - Engager sharding: account đầu tiên đến target discover Post ID 1 lần, các
- *   account sau pop atomic từ shared queue — không ai quét lại timeline.
+ * - ĐÚNG 1 worker/account cho cả job; số browser chạy đồng thời điều tiết bằng
+ *   ConcurrencyLimiter (setting `max_scrape_sessions`, 1-6).
+ * - ScrapeAccountPool quản cooldown + circuit breaker per-account (2 chain 0 lead
+ *   liên tiếp → loại account khỏi job).
+ * - ScrapeTaskBoard chia việc theo KÊNH: cursor (followers) / friends / group /
+ *   post khoá độc quyền theo target; engager harvest song song qua post queue
+ *   (discovery single-flight). Nhờ đó 1 target chạy được nhiều account cùng lúc.
+ * - Cursor chia sẻ theo target lưu DB (last_cursor + resume_target_idx): followers
+ *   GraphQL và phân trang thành viên nhóm đều resume đúng vị trí ở chain kế.
  * - Spare proxy lease ĐỘC QUYỀN: 2 session song song không bao giờ trùng IP;
  *   cạn spare thì dùng proxy mặc định của chính account.
  * - saveLeadBatch atomic qua db.transaction — N worker ghi song song an toàn WAL.
@@ -2195,6 +2353,24 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       let inserted = 0;
       const tx = db.transaction(() => {
         for (const lead of leads) {
+          // P2 — lead phone-only (SĐT bóc từ HTML mbasic, không có uid): ghi thẳng
+          // lead zalo, không đi qua nhánh uid FB.
+          if (!lead.uid && lead.phone) {
+            if (!collectedPhones.has(lead.phone)) {
+              collectedPhones.add(lead.phone);
+              if (autoImport) {
+                insertPhoneLeadStmt.run(
+                  workspaceId,
+                  lead.phone,
+                  lead.displayName || `Khách hàng ${lead.phone}`,
+                  `${targetTag}_SĐT`
+                );
+                phoneCount++;
+                inserted++;
+              }
+            }
+            continue;
+          }
           if (!lead.uid || collectedUids.has(lead.uid.toLowerCase())) continue;
           if (parsedTarget.identifier && lead.uid.toLowerCase() === parsedTarget.identifier.toLowerCase()) continue;
           if (lead.displayName && lead.displayName.trim().startsWith('@')) continue;
@@ -2341,15 +2517,20 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       return;
     }
 
-    // ── P1: parallel session pool ──
+    // ── P2: pool account + slot semaphore + task board kênh song song ──
     const configuredSlots = Math.max(1, Math.min(6,
       options.parallelSessions && options.parallelSessions > 0
         ? options.parallelSessions
         : parseInt(getSetting('max_scrape_sessions', '3'), 10) || 3
     ));
-    const pool = new ScrapeSessionPool(accountQueue, configuredSlots);
+    const pool = new ScrapeAccountPool(accountQueue);
+    const slots = new ConcurrencyLimiter(configuredSlots);
+    const board = new ScrapeTaskBoard(
+      targetList.map(t => ({ kind: parseFacebookTarget(t).type })),
+      { scrapeType }
+    );
 
-    console.log(`[FB Scraper] Job #${jobId} pool: ${accountQueue.length} account, ${pool.getSlots()} session slot song song.`);
+    console.log(`[FB Scraper] Job #${jobId} pool: ${accountQueue.length} account, ${configuredSlots} slot song song, ${targetList.length} target (kênh hybrid).`);
 
     // CD3: trần chuỗi thật của FB / account / chain — vượt chỉ mời 500
     const maxPerAccountQuota = 150;
@@ -2385,8 +2566,7 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       }
     };
 
-    // ── Target lock + shared cursor (DB-backed, account kế tiếp resume) ──
-    const targetLocks: Array<{ holder: number | null }> = targetList.map(() => ({ holder: null }));
+    // ── Cursor chia sẻ theo target (followers GraphQL / trang thành viên nhóm) ──
     const cursorsByTarget: Array<string | null> = targetList.map(() => null);
     const resumeRow = db.prepare(`SELECT last_cursor, resume_target_idx FROM scrape_jobs WHERE id = ?`).get(jobId) as { last_cursor: string | null; resume_target_idx: number | null } | undefined;
     if (resumeRow?.last_cursor) {
@@ -2399,356 +2579,372 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       db.prepare(`UPDATE scrape_jobs SET last_cursor = ?, resume_target_idx = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(cursor, targetIdx, jobId);
     };
 
-    // ── Engager sharding: post queue dùng chung (atomic pop — JS single-thread) ──
-    const postQueuesByTarget: string[][] = targetList.map(() => []);
-    const postDiscoverDone = targetList.map(() => false);
+    // Cache capability theo target (probe 1 lần/target cho cả job) + cờ gap-fill 1 lần
+    const capabilityCache: Array<TargetCapability | null> = targetList.map(() => null);
+    const groupDomDone = targetList.map(() => false);
+    const engagerDomDone = targetList.map(() => false);
+
+    interface AccountChainOutcome {
+      leads: number;
+      requests: number;
+      http500: number;
+      dead: boolean;
+      throttled: boolean;
+      finished: boolean;
+    }
 
     /**
-     * Account worker: 1 chain = 1 browser session trên 1 target. Xong chain,
-     * worker trả slot + target lock, nghỉ cooldown rồi xin việc tiếp.
+     * P2 — Chạy 1 chain: 1 browser session, 1 target, ĐÚNG 1 kênh (cursor/engager/
+     * group/post/friends). Nhờ tách kênh, nhiều account phục vụ cùng target song song.
+     */
+    const runChain = async (accountId: number, task: ClaimedTask, pass: number): Promise<AccountChainOutcome> => {
+      const targetIdx = task.targetIdx;
+      const currentTarget = parseFacebookTarget(targetList[targetIdx]);
+      const out: AccountChainOutcome = { leads: 0, requests: 0, http500: 0, dead: false, throttled: false, finished: false };
+      const spareProxy = pass >= 2 ? pickSpareProxy(accountId) : undefined;
+      let browserContext: BrowserContext | null = null;
+      let sessionRequestsUsed = 0;
+      let sessionHttp500 = 0;
+
+      try {
+        const launched = await setupStealthBrowserContext(accountId, spareProxy);
+        browserContext = launched.context;
+        const accountUsername = launched.accountUsername;
+
+        // Pre-flight login probe (cache 30 phút account vừa xác nhận live)
+        let loggedIn = true;
+        const accCheck = db.prepare(`SELECT status, last_checked FROM social_accounts WHERE id = ?`).get(accountId) as { status: string; last_checked: string | null } | undefined;
+        const lastCheckedMs = parseDbTime(accCheck?.last_checked);
+        const isRecentlyLive = accCheck?.status === 'live' && lastCheckedMs > 0 && (Date.now() - lastCheckedMs < 30 * 60 * 1000);
+        if (isRecentlyLive) {
+          console.log(`[FB Scraper] ⚡ Account #${accountId} vừa probe 'live' <30p trước — bỏ qua probe.`);
+        } else {
+          const probe = await probeAccountLogin(browserContext);
+          if (!probe.live && probe.decisive) {
+            console.warn(`[FB Scraper] ⛔ Account #${accountId} cookie DEAD — loại khỏi pool job.`);
+            const recentLogouts = (db.prepare(`
+              SELECT COUNT(*) as n FROM scrape_telemetry
+              WHERE account_id = ? AND engine = 'facebook_session'
+                AND requests = 0 AND leads_new = 0
+                AND created_at > datetime('now', '-24 hours')
+            `).get(accountId) as { n: number } | undefined)?.n || 0;
+            const cooldownHours = recentLogouts >= 2 ? 12 : recentLogouts === 1 ? 6 : 1;
+            db.prepare(`
+              UPDATE social_accounts
+              SET status = 'die', last_checked = CURRENT_TIMESTAMP,
+                  cooldown_until = datetime('now', '+' || ? || ' hours')
+              WHERE id = ?
+            `).run(cooldownHours, accountId);
+            pool.markExhausted(accountId);
+            loggedIn = false;
+          } else if (probe.live && probe.decisive) {
+            db.prepare(`UPDATE social_accounts SET status = 'live', last_checked = CURRENT_TIMESTAMP WHERE id = ?`).run(accountId);
+          }
+        }
+
+        if (loggedIn) {
+          const page = await browserContext.newPage();
+          page.setDefaultTimeout(35000);
+          page.setDefaultNavigationTimeout(45000);
+          const detachInterceptor = attachFacebookGraphQLInterceptor(page, saveLeadBatch);
+          const closePage = async () => { detachInterceptor(); await page.close().catch(() => {}); };
+
+          const sessionQuota = Math.min(maxPerAccountQuota, Math.max(50, maxLimit - scrapedCount));
+          const sessionRequestBudget = {
+            remaining: 1500,
+            onSpend: () => {
+              sessionRequestsUsed++;
+              if (sessionRequestsUsed % 10 === 0) {
+                db.prepare(`UPDATE social_accounts SET daily_request_count = COALESCE(daily_request_count, 0) + 10 WHERE id = ?`).run(accountId);
+              }
+            },
+          };
+
+          await page.goto(currentTarget.cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
+          await page.waitForTimeout(2500);
+          await dismissFacebookDialogs(page);
+
+          const pageHtml = await page.content().catch(() => '');
+          if (detectFacebookCheckpoint(page.url(), pageHtml)) {
+            console.warn(`[FB Scraper] ⚠️ Account #${accountId} hit Checkpoint — loại khỏi job.`);
+            const proxyIdRow = db.prepare(`SELECT proxy_id FROM social_accounts WHERE id = ?`).get(accountId) as { proxy_id: number | null } | undefined;
+            if (proxyIdRow?.proxy_id) {
+              db.prepare(`UPDATE proxies SET status = 'cooldown' WHERE id = ?`).run(proxyIdRow.proxy_id);
+            }
+            db.prepare(`UPDATE social_accounts SET status = 'checkpoint', cooldown_until = datetime('now', '+60 minutes') WHERE id = ?`).run(accountId);
+            try {
+              db.prepare(`INSERT INTO crawler_logs (workspace_id, target_value, action_type, message) VALUES (?, ?, 'checkpoint', ?)`).run(
+                workspaceId,
+                `account:${accountId}`,
+                `Checkpoint nghiêm trọng — account cooldown 60', proxy ${proxyIdRow?.proxy_id || 'n/a'} cooldown cùng lúc.`
+              );
+            } catch {}
+            sendDesktopNotification(
+              'Tài khoản Facebook bị Checkpoint ⚠️',
+              `Tài khoản #${accountId} (@${accountUsername}) gặp checkpoint. Cooldown 60 phút rồi tự khôi phục.`
+            );
+            pool.markExhausted(accountId);
+            out.dead = true;
+            await closePage();
+            return out;
+          }
+
+          let capability = capabilityCache[targetIdx];
+          if (!capability) {
+            capability = await probeTargetCapability(page, currentTarget.cleanUrl, currentTarget.type);
+            capabilityCache[targetIdx] = capability;
+            console.log(`[FB Scraper] 🔎 Target [${targetIdx + 1}] capability: ${capability.recommendation} — ${capability.notice}`);
+          }
+          const refinedBudget = budgetByType[capability.recommendation];
+          if (refinedBudget) sessionRequestBudget.remaining = refinedBudget;
+
+          const viewerAccountId = await getViewerAccountId(browserContext);
+          const remaining = () => Math.min(sessionQuota - out.leads, maxLimit - scrapedCount);
+
+          if (task.channel === 'group') {
+            // ── KÊNH GROUP: mbasic members (resume phân trang) + DOM gap-fill 1 lần ──
+            if (viewerAccountId) {
+              const mbasicPage = await newMbasicPage(browserContext);
+              try {
+                const res = await scrapeGroupMembersViaMbasic(mbasicPage, currentTarget.cleanUrl, sessionQuota, saveLeadBatch, sessionRequestBudget, cursorsByTarget[targetIdx]);
+                out.leads += res.added;
+                if (res.nextUrl) {
+                  setCursorForTarget(targetIdx, res.nextUrl);
+                } else {
+                  cursorsByTarget[targetIdx] = null;
+                  out.finished = true;
+                }
+                console.log(`[FB Scraper] Account #${accountId} mbasic group: +${res.added} leads (${res.nextUrl ? 'còn trang kế' : 'hết nhóm'}).`);
+              } finally {
+                await mbasicPage.close().catch(() => {});
+              }
+            }
+            if (!cancelSignal.cancelled && remaining() > 0 && !groupDomDone[targetIdx]) {
+              groupDomDone[targetIdx] = true;
+              out.leads += await extractGroupMembersFromDOM(page, currentTarget.cleanUrl, saveLeadBatch, remaining(), cancelSignal);
+            }
+          } else if (task.channel === 'post') {
+            // ── KÊNH POST: engagement DOM + reaction sâu + commenters ──
+            out.leads += await extractTimelineEngagement(page, currentTarget.cleanUrl, saveLeadBatch, sessionQuota, cancelSignal);
+            const postId = extractPostIdFromUrl(currentTarget.cleanUrl);
+            if (postId && viewerAccountId && remaining() > 0 && !cancelSignal.cancelled) {
+              const mbasicPage = await newMbasicPage(browserContext);
+              try {
+                out.leads += await scrapeMbasicReactionsForPost(mbasicPage, postId, viewerAccountId, Math.min(remaining(), maxLimit - scrapedCount), saveLeadBatch, sessionRequestBudget);
+                if (remaining() > 0 && sessionRequestBudget.remaining > 0) {
+                  out.leads += await scrapeMbasicCommentersForPost(mbasicPage, postId, Math.min(remaining(), maxLimit - scrapedCount), saveLeadBatch, sessionRequestBudget);
+                }
+              } finally {
+                await mbasicPage.close().catch(() => {});
+              }
+            }
+            out.finished = true;
+          } else if (task.channel === 'friends') {
+            // ── KÊNH FRIENDS: bạn bè công khai (một lần/target) ──
+            const friendsUrl = `${currentTarget.cleanUrl.replace(/\/$/, '')}/friends`;
+            out.leads += await extractPeopleListFromDOM(page, friendsUrl, 'friend', saveLeadBatch, remaining(), cancelSignal);
+            out.finished = true;
+          } else if (task.channel === 'cursor') {
+            // ── KÊNH CURSOR: followers GraphQL (passive + active replay) ──
+            if (!capability.followerListPublic || !viewerAccountId) {
+              out.finished = true;
+              console.log(`[FB Scraper] Kênh cursor target [${targetIdx + 1}]: follower list không công khai — đóng kênh, engager lo phần còn lại.`);
+            } else {
+              const followersUrl = `${currentTarget.cleanUrl.replace(/\/$/, '')}/followers`;
+              const capture = createFollowerCapture();
+              const detachWithCapture = attachFacebookGraphQLInterceptor(page, saveLeadBatch, capture);
+              try {
+                console.log(`[FB Scraper] 🎯 Account #${accountId} mở /followers để capture query template...`);
+                await page.goto(followersUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
+                await page.waitForTimeout(2500);
+                await dismissFacebookDialogs(page);
+
+                if (!targetFollowerCount) {
+                  const headerText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+                  const fc = extractFollowerCountFromText(headerText || '');
+                  if (fc) {
+                    targetFollowerCount = fc;
+                    db.prepare(`UPDATE scrape_jobs SET target_follower_count = ?, target_follower_name = ? WHERE id = ?`).run(fc, currentTarget.identifier, jobId);
+                    console.log(`[FB Scraper] 📊 Target có ~${fc.toLocaleString('vi-VN')} followers — theo dõi độ phủ trên UI.`);
+                  }
+                }
+
+                for (let i = 0; i < 7 && (!capture.endpoint || !capture.cursor) && !cancelSignal.cancelled; i++) {
+                  await page.waitForTimeout(2000);
+                  if (!capture.endpoint || !capture.cursor) {
+                    await page.evaluate(() => {
+                      window.scrollBy(0, 600 + Math.floor(Math.random() * 300));
+                      const buttons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"], a[role="button"], button'));
+                      for (const btn of buttons) {
+                        const txt = (btn.textContent || '').toLowerCase().trim();
+                        if (txt === 'xem thêm' || txt === 'see more' || txt === 'tải thêm' || txt.includes('hiển thị thêm')) {
+                          (btn as HTMLElement).click();
+                          break;
+                        }
+                      }
+                    }).catch(() => {});
+                  }
+                }
+
+                if (!capture.endpoint) {
+                  console.log(`[FB Scraper] ⚠️ Không capture được follower query — DOM gap-fill một lần rồi đóng kênh.`);
+                  if (remaining() > 0) {
+                    out.leads += await extractPeopleListFromDOM(page, followersUrl, 'follower', saveLeadBatch, remaining(), cancelSignal);
+                  }
+                  out.finished = true;
+                } else {
+                  const targetStartCount = scrapedCount;
+                  const cursorToResume = cursorsByTarget[targetIdx] || capture.cursor;
+                  const replayFrom = async (cursor: string): Promise<void> => {
+                    const followerBudget = { remaining: Math.min(600, sessionRequestBudget.remaining), onSpend: sessionRequestBudget.onSpend };
+                    const result = await harvestFollowersByCursor(
+                      page, capture, cursor, saveLeadBatch,
+                      remaining(), cancelSignal, followerBudget,
+                      (_n: number, cur: string | null) => {
+                        if (cur) setCursorForTarget(targetIdx, cur);
+                      }
+                    );
+                    out.leads += result.newLeads;
+                    sessionHttp500 += result.http500;
+                    if (result.ended === 'throttled') out.throttled = true;
+                    if (result.nextCursor) setCursorForTarget(targetIdx, result.nextCursor);
+                    else cursorsByTarget[targetIdx] = null;
+                    console.log(`[FB Scraper] ⚡ Cursor replay: +${result.newLeads} leads (kết thúc: ${result.ended}, 500s: ${result.http500}).`);
+                  };
+
+                  if (cursorToResume) {
+                    // Cursor chia sẻ tồn tại → replay thẳng, bỏ qua cuộn trùng đầu trang
+                    await replayFrom(cursorToResume);
+                  } else {
+                    const passiveResult = await harvestFollowersPassive(
+                      page, capture,
+                      () => Math.max(0, scrapedCount - targetStartCount),
+                      remaining(), cancelSignal,
+                      { scrollWaitMs: 4500, requestBudget: sessionRequestBudget, onProgress: (_total, cur) => {
+                          if (cur) setCursorForTarget(targetIdx, cur);
+                        } }
+                    );
+                    const passiveDelta = Math.max(0, scrapedCount - targetStartCount);
+                    out.leads += passiveDelta;
+                    console.log(`[FB Scraper] 🌿 Passive Scroll: +${passiveDelta} leads (kết thúc: ${passiveResult.ended}).`);
+                    if (!cancelSignal.cancelled && remaining() > 0 && cursorsByTarget[targetIdx] && (!passiveResult || passiveResult.ended === 'stagnant' || passiveResult.ended === 'done')) {
+                      await replayFrom(cursorsByTarget[targetIdx]!);
+                    }
+                  }
+                  // Phân biệt "hết danh sách" vs "chạm quota": engine trả 'done' cho CẢ HAI
+                  // (loop thoát vì đủ maxLeads cũng là 'done'). Chỉ đóng kênh khi còn quota
+                  // mà danh sách đã hết; chạm quota thì giữ cursor cho chain kế tiếp.
+                  const hitQuota = remaining() <= 0;
+                  if (!hitQuota && !out.throttled && !cancelSignal.cancelled) {
+                    cursorsByTarget[targetIdx] = null;
+                    out.finished = true;
+                  }
+                }
+              } finally {
+                detachWithCapture();
+              }
+            }
+          } else {
+            // ── KÊNH ENGAGER: reaction + commenters chia queue, discovery single-flight ──
+            if (!viewerAccountId) {
+              out.finished = true;
+            } else {
+              const mbasicPage = await newMbasicPage(browserContext);
+              try {
+                if (task.doDiscovery) {
+                  const maxPosts = capability.recommendation === 'engager_only'
+                    ? Math.max(150, Math.min(600, Math.ceil((maxLimit - scrapedCount) / 10)))
+                    : Math.max(20, Math.min(40, Math.ceil(maxLimit / 50)));
+                  const ids = await discoverMbasicPostIds(mbasicPage, currentTarget.cleanUrl, maxPosts, saveLeadBatch, sessionRequestBudget);
+                  board.enqueuePosts(targetIdx, ids);
+                  board.markDiscoveryDone(targetIdx);
+                  console.log(`[FB Scraper] 🔍 Discovery target [${targetIdx + 1}]: ${ids.length} bài vào queue chia pool.`);
+                }
+
+                let shardLeads = 0;
+                while (remaining() > 0 && !cancelSignal.cancelled && sessionRequestBudget.remaining > 0) {
+                  const postId = board.popPost(targetIdx);
+                  if (!postId) break;
+                  const quota = Math.min(remaining(), maxLimit - scrapedCount);
+                  shardLeads += await scrapeMbasicReactionsForPost(mbasicPage, postId, viewerAccountId, quota, saveLeadBatch, sessionRequestBudget);
+                  if (remaining() > 0 && sessionRequestBudget.remaining > 0 && !cancelSignal.cancelled) {
+                    shardLeads += await scrapeMbasicCommentersForPost(mbasicPage, postId, Math.min(remaining(), maxLimit - scrapedCount), saveLeadBatch, sessionRequestBudget);
+                  }
+                  board.notePostDrained(targetIdx);
+                }
+                out.leads += shardLeads;
+                console.log(`[FB Scraper] Account #${accountId} engager shard: +${shardLeads} leads.`);
+              } finally {
+                await mbasicPage.close().catch(() => {});
+              }
+
+              // Gap-fill DOM 1 lần khi timeline riêng tư (SĐT + comment) — nguồn phụ
+              if (capability.recommendation === 'engager_only' && remaining() > 0 && !engagerDomDone[targetIdx] && !cancelSignal.cancelled) {
+                engagerDomDone[targetIdx] = true;
+                out.leads += await extractTimelineEngagement(page, currentTarget.cleanUrl, saveLeadBatch, remaining(), cancelSignal);
+              }
+            }
+          }
+
+          await closePage();
+        }
+      } catch (sessionErr: unknown) {
+        const sessionMsg = sessionErr instanceof Error ? sessionErr.message : String(sessionErr);
+        console.error(`[FB Scraper] Session error Account #${accountId}:`, sessionMsg);
+      } finally {
+        try {
+          db.prepare(`
+            INSERT INTO scrape_telemetry (job_id, account_id, engine, requests, leads_new, throttle_events, http_500)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
+          `).run(jobId, accountId, `chain_${task.channel}`, sessionRequestsUsed || 0, out.leads || 0, sessionHttp500 || 0);
+        } catch (telErr: unknown) {
+          console.warn(`[FB Scraper] Telemetry insert lỗi:`, telErr instanceof Error ? telErr.message : telErr);
+        }
+        if (spareProxy) leasedProxyIds.delete(spareProxy.proxyId);
+        if (browserContext) {
+          try { await browserContext.close(); } catch {}
+        }
+      }
+      out.requests = sessionRequestsUsed;
+      out.http500 = sessionHttp500;
+      return out;
+    };
+
+    /**
+     * Worker: ĐÚNG 1 worker / account cho cả job (không spawn trùng — bug P1).
+     * Vòng: chờ hết cooldown → lấy slot → claim task kênh → chạy chain → nhả.
      */
     const runAccountWorker = async (accountId: number): Promise<void> => {
       let pass = 1;
-
-      while (!cancelSignal.cancelled && scrapedCount < maxLimit && !pool.getAccount(accountId)!.exhausted) {
-        // Chọn target: ưu tiên target rảnh; tất cả bận → steal target của
-        // account đang nghỉ giữa chain (không phải đang giữ slot) hoặc join post queue
-        let targetIdx = targetLocks.findIndex(l => l.holder === null);
-        if (targetIdx === -1) {
-          const stealIdx = targetLocks.findIndex(l => l.holder !== null && !pool.busyIds().includes(l.holder!));
-          if (stealIdx >= 0) {
-            targetLocks[stealIdx].holder = null;
-            targetIdx = stealIdx;
-          } else {
-            const joinIdx = targetLocks.findIndex((_l, i) => postQueuesByTarget[i].length > 0);
-            if (joinIdx >= 0) {
-              targetIdx = joinIdx;
-            } else {
-              // Mọi target đang bận bởi session sống — nghỉ ngắn chờ slot
-              await sleep(4000 + Math.floor(Math.random() * 3000));
-              continue;
-            }
-          }
+      while (!cancelSignal.cancelled && scrapedCount < maxLimit && !pool.get(accountId)!.exhausted) {
+        const waitMs = pool.cooldownRemaining(accountId, Date.now());
+        if (waitMs > 0) {
+          await sleep(Math.min(waitMs + 250, 30_000));
+          continue;
         }
-        targetLocks[targetIdx].holder = accountId;
 
-        const currentTarget = parseFacebookTarget(targetList[targetIdx]);
-        const spareProxy = pass >= 2 ? pickSpareProxy(accountId) : undefined;
-        const chainStartScraped = scrapedCount;
+        const releaseSlot = await slots.acquire();
+        const task = board.claim(accountId);
+        if (!task) {
+          releaseSlot();
+          if (board.isExhausted(accountId)) break;
+          await sleep(3000 + Math.floor(Math.random() * 2000));
+          continue;
+        }
 
-        console.log(`[FB Scraper] 🔄 Account #${accountId} chain ${pass} → target [${targetIdx + 1}/${targetList.length}] ${currentTarget.cleanUrl}${spareProxy ? ` (spare proxy #${spareProxy.proxyId})` : ' (proxy mặc định)'}.`);
-
-        let browserContext: BrowserContext | null = null;
-        let sessionRequestsUsed = 0;
-        let sessionHttp500 = 0;
-        let sessionLeads = 0;
-        let workerDead = false;   // checkpoint/cookie die → loại khỏi pool vĩnh viễn
-        let chainThrottled = false; // soft-throttle FB → cooldown tài khoản ngay
-
+        let outcome: AccountChainOutcome | null = null;
         try {
-          const launched = await setupStealthBrowserContext(accountId, spareProxy);
-          browserContext = launched.context;
-          const accountUsername = launched.accountUsername;
-
-          // Pre-flight login probe (cache 30 phút account vừa xác nhận live)
-          let loggedIn = true;
-          const accCheck = db.prepare(`SELECT status, last_checked FROM social_accounts WHERE id = ?`).get(accountId) as { status: string; last_checked: string | null } | undefined;
-          const lastCheckedMs = accCheck?.last_checked ? Date.parse(accCheck.last_checked.includes('T') ? accCheck.last_checked : accCheck.last_checked.replace(' ', 'T') + 'Z') : 0;
-          const isRecentlyLive = accCheck?.status === 'live' && !isNaN(lastCheckedMs) && (Date.now() - lastCheckedMs < 30 * 60 * 1000);
-          if (isRecentlyLive) {
-            console.log(`[FB Scraper] ⚡ Account #${accountId} vừa probe 'live' <30p trước — bỏ qua probe.`);
-          } else {
-            const probe = await probeAccountLogin(browserContext);
-            if (!probe.live && probe.decisive) {
-              console.warn(`[FB Scraper] ⛔ Account #${accountId} cookie DEAD — loại khỏi pool job.`);
-              const recentLogouts = (db.prepare(`
-                SELECT COUNT(*) as n FROM scrape_telemetry
-                WHERE account_id = ? AND engine = 'facebook_session'
-                  AND requests = 0 AND leads_new = 0
-                  AND created_at > datetime('now', '-24 hours')
-              `).get(accountId) as { n: number } | undefined)?.n || 0;
-              const cooldownHours = recentLogouts >= 2 ? 12 : recentLogouts === 1 ? 6 : 1;
-              db.prepare(`
-                UPDATE social_accounts
-                SET status = 'die', last_checked = CURRENT_TIMESTAMP,
-                    cooldown_until = datetime('now', '+' || ? || ' hours')
-                WHERE id = ?
-              `).run(cooldownHours, accountId);
-              pool.markExhausted(accountId);
-              loggedIn = false;
-            } else if (probe.live && probe.decisive) {
-              db.prepare(`UPDATE social_accounts SET status = 'live', last_checked = CURRENT_TIMESTAMP WHERE id = ?`).run(accountId);
-            }
-          }
-
-          if (loggedIn) {
-            const page = await browserContext.newPage();
-            page.setDefaultTimeout(35000);
-            page.setDefaultNavigationTimeout(45000);
-            const detachInterceptor = attachFacebookGraphQLInterceptor(page, saveLeadBatch);
-            const closePage = async () => { detachInterceptor(); await page.close().catch(() => {}); };
-
-            const sessionQuota = Math.min(maxPerAccountQuota, Math.max(50, maxLimit - scrapedCount));
-            const sessionRequestBudget = {
-              remaining: 1500,
-              onSpend: () => {
-                sessionRequestsUsed++;
-                if (sessionRequestsUsed % 10 === 0) {
-                  db.prepare(`UPDATE social_accounts SET daily_request_count = COALESCE(daily_request_count, 0) + 10 WHERE id = ?`).run(accountId);
-                }
-              },
-            };
-
-            await page.goto(currentTarget.cleanUrl, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
-            await page.waitForTimeout(2500);
-            await dismissFacebookDialogs(page);
-
-            const pageHtml = await page.content().catch(() => '');
-            if (detectFacebookCheckpoint(page.url(), pageHtml)) {
-              console.warn(`[FB Scraper] ⚠️ Account #${accountId} hit Checkpoint — loại khỏi job.`);
-              const proxyIdRow = db.prepare(`SELECT proxy_id FROM social_accounts WHERE id = ?`).get(accountId) as { proxy_id: number | null } | undefined;
-              if (proxyIdRow?.proxy_id) {
-                db.prepare(`UPDATE proxies SET status = 'cooldown' WHERE id = ?`).run(proxyIdRow.proxy_id);
-              }
-              db.prepare(`UPDATE social_accounts SET status = 'checkpoint', cooldown_until = datetime('now', '+60 minutes') WHERE id = ?`).run(accountId);
-              try {
-                db.prepare(`INSERT INTO crawler_logs (workspace_id, target_value, action_type, message) VALUES (?, ?, 'checkpoint', ?)`).run(
-                  workspaceId,
-                  `account:${accountId}`,
-                  `Checkpoint nghiêm trọng — account cooldown 60', proxy ${proxyIdRow?.proxy_id || 'n/a'} cooldown cùng lúc.`
-                );
-              } catch {}
-              sendDesktopNotification(
-                'Tài khoản Facebook bị Checkpoint ⚠️',
-                `Tài khoản #${accountId} (@${accountUsername}) gặp checkpoint. Cooldown 60 phút rồi tự khôi phục.`
-              );
-              workerDead = true;
-              await closePage();
-            } else {
-              const targetCapability = await probeTargetCapability(page, currentTarget.cleanUrl, currentTarget.type);
-              console.log(`[FB Scraper] 🔎 Target capability: ${targetCapability.recommendation} — ${targetCapability.notice}`);
-              const refinedBudget = budgetByType[targetCapability.recommendation];
-              if (refinedBudget && refinedBudget !== sessionRequestBudget.remaining) {
-                sessionRequestBudget.remaining = refinedBudget;
-              }
-
-              // ── GROUP: mbasic members là nguồn chính ──
-              if (currentTarget.type === 'group' || scrapeType === 'members') {
-                const viewerAccountId = await getViewerAccountId(browserContext);
-                if (viewerAccountId) {
-                  const mbasicPage = await newMbasicPage(browserContext);
-                  try {
-                    const mbasicCount = await scrapeGroupMembersViaMbasic(mbasicPage, currentTarget.cleanUrl, sessionQuota, saveLeadBatch, sessionRequestBudget);
-                    sessionLeads += mbasicCount;
-                    console.log(`[FB Scraper] Account #${accountId} mbasic group: +${mbasicCount} leads.`);
-                  } finally {
-                    await mbasicPage.close().catch(() => {});
-                  }
-                }
-                if (!cancelSignal.cancelled && scrapedCount < maxLimit && sessionLeads < sessionQuota) {
-                  const domCount = await extractGroupMembersFromDOM(page, currentTarget.cleanUrl, saveLeadBatch, Math.min(sessionQuota - sessionLeads, maxLimit - scrapedCount), cancelSignal);
-                  sessionLeads += domCount;
-                }
-              }
-              // ── POST: engagement + reaction sâu ──
-              else if (currentTarget.type === 'post' || scrapeType === 'post_commenters') {
-                const count = await extractTimelineEngagement(page, currentTarget.cleanUrl, saveLeadBatch, sessionQuota, cancelSignal);
-                sessionLeads += count;
-                if (!cancelSignal.cancelled && scrapedCount < maxLimit && sessionLeads < sessionQuota) {
-                  const postId = extractPostIdFromUrl(currentTarget.cleanUrl);
-                  const viewerAccountId = await getViewerAccountId(browserContext);
-                  if (postId && viewerAccountId) {
-                    const mbasicPage = await newMbasicPage(browserContext);
-                    try {
-                      const mbasicCount = await scrapeMbasicReactionsForPost(mbasicPage, postId, viewerAccountId, Math.min(sessionQuota - sessionLeads, maxLimit - scrapedCount), saveLeadBatch, sessionRequestBudget);
-                      sessionLeads += mbasicCount;
-                    } finally {
-                      await mbasicPage.close().catch(() => {});
-                    }
-                  }
-                }
-              }
-              // ── FANPAGE / PROFILE ──
-              else {
-                const remainingQuota = () => Math.min(sessionQuota - sessionLeads, maxLimit - scrapedCount);
-                const viewerAccountId = await getViewerAccountId(browserContext);
-                let cursorCapturedEndpoint = false;
-
-                // 3.1 FOLLOWERS CURSOR ENGINE — chỉ khi probe xác nhận follower list public
-                if (targetCapability.followerListPublic && viewerAccountId && remainingQuota() > 0 && scrapeType !== 'post_commenters') {
-                  const capture = createFollowerCapture();
-                  const detachWithCapture = attachFacebookGraphQLInterceptor(page, saveLeadBatch, capture);
-
-                  console.log(`[FB Scraper] 🎯 Account #${accountId} mở /followers để capture query template...`);
-                  await page.goto(`${currentTarget.cleanUrl.replace(/\/$/, '')}/followers`, { waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {});
-                  await page.waitForTimeout(2500);
-                  await dismissFacebookDialogs(page);
-
-                  if (!targetFollowerCount) {
-                    const headerText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
-                    const fc = extractFollowerCountFromText(headerText || '');
-                    if (fc) {
-                      targetFollowerCount = fc;
-                      db.prepare(`UPDATE scrape_jobs SET target_follower_count = ?, target_follower_name = ? WHERE id = ?`).run(fc, currentTarget.identifier, jobId);
-                      console.log(`[FB Scraper] 📊 Target có ~${fc.toLocaleString('vi-VN')} followers — theo dõi độ phủ trên UI.`);
-                    }
-                  }
-
-                  // Đợi capture endpoint + cursor (tối đa ~14s, scroll nhẹ kích hoạt lazy-load)
-                  for (let i = 0; i < 7 && (!capture.endpoint || !capture.cursor) && !cancelSignal.cancelled; i++) {
-                    await page.waitForTimeout(2000);
-                    if (!capture.endpoint || !capture.cursor) {
-                      await page.evaluate(() => {
-                        window.scrollBy(0, 600 + Math.floor(Math.random() * 300));
-                        const buttons = Array.from(document.querySelectorAll('div[role="button"], span[role="button"], a[role="button"], button'));
-                        for (const btn of buttons) {
-                          const txt = (btn.textContent || '').toLowerCase().trim();
-                          if (txt === 'xem thêm' || txt === 'see more' || txt === 'tải thêm' || txt.includes('hiển thị thêm')) {
-                            (btn as HTMLElement).click();
-                            break;
-                          }
-                        }
-                      }).catch(() => {});
-                    }
-                  }
-
-                  if (capture.endpoint) {
-                    cursorCapturedEndpoint = true;
-                    const targetStartCount = scrapedCount;
-                    const cursorToResume = cursorsByTarget[targetIdx] || capture.cursor;
-
-                    if (cursorToResume && pass >= 2) {
-                      // Nối chuỗi từ cursor chia sẻ — bỏ qua cuộn trùng đầu trang
-                      console.log(`[FB Scraper] ⚡ Account #${accountId} Active Cursor Replay từ cursor chia sẻ...`);
-                      const followerBudget = { remaining: Math.min(600, sessionRequestBudget.remaining), onSpend: sessionRequestBudget.onSpend };
-                      const result = await harvestFollowersByCursor(
-                        page, capture, cursorToResume, saveLeadBatch,
-                        remainingQuota(), cancelSignal, followerBudget,
-                        (_n: number, cur: string | null) => {
-                          if (cur) setCursorForTarget(targetIdx, cur);
-                        }
-                      );
-                      sessionLeads += result.newLeads;
-                      sessionHttp500 += result.http500;
-                      console.log(`[FB Scraper] ⚡ Cursor Replay: +${result.newLeads} leads (kết thúc: ${result.ended}, 500s: ${result.http500}).`);
-                      if (result.ended === 'throttled') chainThrottled = true;
-                      if (result.nextCursor) setCursorForTarget(targetIdx, result.nextCursor);
-                    } else {
-                      // Pass 1: passive scroll từ đầu trang
-                      const passiveResult = await harvestFollowersPassive(
-                        page, capture,
-                        () => Math.max(0, scrapedCount - targetStartCount),
-                        remainingQuota(), cancelSignal,
-                        { scrollWaitMs: 4500, requestBudget: sessionRequestBudget, onProgress: (_total, cur) => {
-                            if (cur) setCursorForTarget(targetIdx, cur);
-                          } }
-                      );
-                      const passiveDelta = Math.max(0, scrapedCount - targetStartCount);
-                      sessionLeads += passiveDelta;
-                      console.log(`[FB Scraper] 🌿 Passive Scroll: +${passiveDelta} leads (kết thúc: ${passiveResult.ended}).`);
-
-                      if (!cancelSignal.cancelled && remainingQuota() > 0 && cursorsByTarget[targetIdx] && (!passiveResult || passiveResult.ended === 'stagnant' || passiveResult.ended === 'done')) {
-                        console.log(`[FB Scraper] ⚡ Chuyển Active Cursor nối tiếp...`);
-                        const followerBudget = { remaining: Math.min(600, sessionRequestBudget.remaining), onSpend: sessionRequestBudget.onSpend };
-                        const result = await harvestFollowersByCursor(
-                          page, capture, cursorsByTarget[targetIdx], saveLeadBatch,
-                          remainingQuota(), cancelSignal, followerBudget,
-                          (_n: number, cur: string | null) => {
-                            if (cur) setCursorForTarget(targetIdx, cur);
-                          }
-                        );
-                        sessionLeads += result.newLeads;
-                        sessionHttp500 += result.http500;
-                        console.log(`[FB Scraper] ⚡ Active Cursor nối tiếp: +${result.newLeads} leads (kết thúc: ${result.ended}, 500s: ${result.http500}).`);
-                        if (result.ended === 'throttled') chainThrottled = true;
-                        if (result.nextCursor) setCursorForTarget(targetIdx, result.nextCursor);
-                      }
-                    }
-                  } else {
-                    console.log(`[FB Scraper] ⚠️ Không capture được follower query — chuyển mbasic engager.`);
-                  }
-                  detachWithCapture();
-                }
-
-                // 3.2 Mbasic engager sharding — post queue chia pool
-                const isEngagerPrimary = targetCapability.recommendation === 'engager_only' || scrapeType === 'post_commenters' || scrapeType === 'engager_only';
-                const cursorFailedToCapture = targetCapability.followerListPublic && !cursorCapturedEndpoint;
-                if (!cancelSignal.cancelled && remainingQuota() > 0 && scrapeType !== 'followers_only' && (isEngagerPrimary || cursorFailedToCapture)) {
-                  if (viewerAccountId) {
-                    const mbasicPage = await newMbasicPage(browserContext);
-                    try {
-                      // Discover 1 lần cho target (account đầu tiên tới); account sau pop từ queue
-                      if (!postDiscoverDone[targetIdx]) {
-                        const maxPosts = targetCapability.recommendation === 'engager_only'
-                          ? Math.max(150, Math.min(600, Math.ceil((maxLimit - scrapedCount) / 10)))
-                          : Math.max(20, Math.min(40, Math.ceil(maxLimit / 50)));
-                        const ids = await discoverMbasicPostIds(mbasicPage, currentTarget.cleanUrl, maxPosts, sessionRequestBudget);
-                        postQueuesByTarget[targetIdx].push(...ids);
-                        postDiscoverDone[targetIdx] = true;
-                      }
-
-                      let shardLeads = 0;
-                      while (postQueuesByTarget[targetIdx].length > 0 && remainingQuota() > 0 && !cancelSignal.cancelled) {
-                        if (sessionRequestBudget.remaining <= 0) break;
-                        const postId = postQueuesByTarget[targetIdx].pop()!;
-                        shardLeads += await scrapeMbasicReactionsForPost(
-                          mbasicPage, postId, viewerAccountId,
-                          Math.min(remainingQuota(), maxLimit - scrapedCount),
-                          saveLeadBatch, sessionRequestBudget
-                        );
-                      }
-                      sessionLeads += shardLeads;
-                      console.log(`[FB Scraper] Account #${accountId} engager shard: +${shardLeads} leads (queue còn ${postQueuesByTarget[targetIdx].length} bài).`);
-                    } finally {
-                      await mbasicPage.close().catch(() => {});
-                    }
-                  }
-
-                  if (!cancelSignal.cancelled && remainingQuota() > 0 && targetCapability.followerListPublic && cursorFailedToCapture) {
-                    const followerDomCount = await extractFollowersFromDOM(page, currentTarget.cleanUrl, saveLeadBatch, remainingQuota(), cancelSignal);
-                    sessionLeads += followerDomCount;
-                  }
-                }
-
-                // 3.3 Gap-fill DOM: SĐT từ bình luận (engager_only)
-                if (!cancelSignal.cancelled && remainingQuota() > 0 && isEngagerPrimary) {
-                  const engCount = await extractTimelineEngagement(page, currentTarget.cleanUrl, saveLeadBatch, remainingQuota(), cancelSignal);
-                  sessionLeads += engCount;
-                  console.log(`[FB Scraper] DOM engagement gap-fill: +${engCount} leads.`);
-                }
-              }
-
-              await closePage();
-            }
-          }
-        } catch (sessionErr: unknown) {
-          const sessionMsg = sessionErr instanceof Error ? sessionErr.message : String(sessionErr);
-          console.error(`[FB Scraper] Session error Account #${accountId}:`, sessionMsg);
+          console.log(`[FB Scraper] 🔄 Account #${accountId} chain ${pass} → target [${task.targetIdx + 1}/${targetList.length}] kênh [${task.channel}].`);
+          outcome = await runChain(accountId, task, pass);
+          if (outcome.finished) board.markFinished(task.targetIdx, task.channel);
         } finally {
-          try {
-            db.prepare(`
-              INSERT INTO scrape_telemetry (job_id, account_id, engine, requests, leads_new, throttle_events, http_500)
-              VALUES (?, ?, 'facebook_session', ?, ?, 0, ?)
-            `).run(jobId, accountId, sessionRequestsUsed || 0, sessionLeads || 0, sessionHttp500 || 0);
-          } catch (telErr: unknown) {
-            console.warn(`[FB Scraper] Telemetry insert lỗi:`, telErr instanceof Error ? telErr.message : telErr);
-          }
-          if (spareProxy) leasedProxyIds.delete(spareProxy.proxyId);
-          if (browserContext) {
-            try { await browserContext.close(); } catch {}
-          }
+          board.release(task, accountId);
+          releaseSlot();
         }
 
-        // Trả target lock nếu account vẫn là holder
-        if (targetLocks[targetIdx].holder === accountId) {
-          targetLocks[targetIdx].holder = null;
-        }
-
-        // Worker bị loại (checkpoint/cookie die) → thoát hẳn
-        if (workerDead || pool.getAccount(accountId)!.exhausted) break;
-
-        // Throttle FB: cooldown tài khoản qua DB để job khác cũng thấy
-        if (chainThrottled) {
+        const chainLeads = outcome?.leads ?? 0;
+        if (pool.get(accountId)!.exhausted) break;
+        if (outcome?.throttled) {
           const throttleCount = (db.prepare(`
             SELECT COUNT(*) as n FROM scrape_telemetry
             WHERE account_id = ? AND http_500 > 0
@@ -2759,51 +2955,28 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           console.warn(`[FB Scraper] Account #${accountId} throttle (lần ${throttleCount + 1}/24h) — cooldown ${cooldownMin} phút, cursor đã giữ.`);
         }
 
-        // Chain xong: unproductive → cooldown dài; chain đủ 150 → nghỉ 10' (trần FB)
-        const chainLeads = scrapedCount - chainStartScraped;
-        const cooldownMs = chainThrottled
+        const cooldownMs = outcome?.throttled
           ? 2 * 60_000
           : chainLeads === 0
             ? 5 * 60_000
-            : sessionLeads >= maxPerAccountQuota
+            : chainLeads >= maxPerAccountQuota
               ? 10 * 60_000
               : 60_000;
-        pool.release(accountId, { now: Date.now(), cooldownMs, unproductive: chainLeads === 0, maxUnproductive: 2 });
+        pool.noteChainDone(accountId, { now: Date.now(), cooldownMs, unproductive: chainLeads === 0, maxUnproductive: 2 });
         pass++;
-        console.log(`[FB Scraper] ⏳ Account #${accountId} chain xong (+${chainLeads} leads) — nghỉ ${Math.round(cooldownMs / 1000)}s.`);
+        console.log(`[FB Scraper] ⏳ Account #${accountId} chain [${task.channel}] xong (+${chainLeads} leads) — nghỉ ${Math.round(cooldownMs / 1000)}s.`);
       }
     };
 
-    // ── Pool scheduler: cấp slot → spawn worker, chờ tới khi pool chết/đủ quota ──
+    // ── Spawn 1 worker/account; slot semaphore điều tiết browser song song ──
     try {
-      const workerPromises: Array<Promise<void>> = [];
-
-      while (!cancelSignal.cancelled && scrapedCount < maxLimit && pool.isAlive()) {
-        const acquire = pool.acquireNext({ now: Date.now(), passToken: 1 });
-        if (acquire.granted && acquire.accountId) {
-          workerPromises.push(
-            runAccountWorker(acquire.accountId)
-              .catch(err => {
-                console.error(`[FB Scraper] Worker Account #${acquire.accountId} crashed:`, err instanceof Error ? err.message : err);
-                pool.markExhausted(acquire.accountId!);
-              })
-          );
-          continue;
-        }
-
-        if (acquire.reason === 'all-slots-busy' || acquire.reason === 'all-resting') {
-          // còn worker sống → chờ; pool trống → dừng
-          const waitMs = poolWaitMs(pool, Date.now());
-          if (workerPromises.length === 0) break;
-          await sleep(Math.min(Math.max(waitMs, 3000), 30_000));
-          continue;
-        }
-        if (acquire.reason === 'all-exhausted' || acquire.reason === 'no-accounts') break;
-        await sleep(5000);
-      }
-
-      if (scrapedCount >= maxLimit) pool.skipRests();
-      await Promise.allSettled(workerPromises);
+      const workers = accountQueue.map(id =>
+        runAccountWorker(id).catch(err => {
+          console.error(`[FB Scraper] Worker Account #${id} crashed:`, err instanceof Error ? err.message : err);
+          pool.markExhausted(id);
+        })
+      );
+      await Promise.allSettled(workers);
     } catch (error: unknown) {
       const fatalMsg = error instanceof Error ? error.message : String(error);
       console.error(`[FB Scraper] Fatal error executing job #${jobId}:`, fatalMsg);
@@ -2826,7 +2999,7 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
         : 'completed';
     if (finalStatus === 'failed') {
       db.prepare(`UPDATE scrape_jobs SET error_msg = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(
-        'Toàn bộ account trong pool bị loại (checkpoint / cookie die / 0 lead liên tiếp) — không thu được lead nào. Kiểm tra account, proxy rồi chạy lại.',
+        `Toàn bộ ${pool.exhaustedCount()} account trong pool bị loại (checkpoint / cookie die / 0 lead liên tiếp) — không thu được lead nào. Kiểm tra account, proxy rồi chạy lại.`,
         jobId
       );
     }
