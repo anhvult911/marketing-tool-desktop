@@ -75,4 +75,7 @@ export const browserLimiter = new ConcurrencyLimiter(2);
 // Scrape jobs chạy dài (10-60 phút) — tách limiter riêng để không đói job post/comment
 // vốn cần slot browser nhanh. 2 scrape + 2 automation song song.
 export const scrapeLimiter = new ConcurrencyLimiter(2);
+// P3 — Telegram scrape tách khỏi browserLimiter: trước đây job cào Telegram tranh
+// slot với job đăng bài → job đăng bài bị chặn hàng chục phút.
+export const telegramScrapeLimiter = new ConcurrencyLimiter(2);
 export default browserLimiter;

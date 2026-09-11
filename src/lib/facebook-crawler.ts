@@ -2,6 +2,7 @@ import { chromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import db, { getSetting } from './db';
+import { extractVietnamesePhones, minePhonesFromHtml } from './lead-utils';
 import { scrapeLimiter, ConcurrencyLimiter } from './concurrency';
 import { ScrapeAccountPool } from './scrape-pool';
 import { ScrapeTaskBoard } from './scrape-tasks';
@@ -315,27 +316,9 @@ export function extractUidFromHovercard(hovercard: string): { uid: string; isPag
   return { uid: '', isPage: false };
 }
 
-/**
- * Extract Vietnamese Phone numbers from raw text (comments, descriptions, bios)
- */
-export function extractVietnamesePhones(text: string): string[] {
-  if (!text) return [];
-  const phoneRegex = /(?:(?:\+84|84|0)(?:3[2-9]|5[25689]|7[06-9]|8[1-9]|9[0-9]))\d{7}\b/g;
-  const matches = text.match(phoneRegex) || [];
-  const uniquePhones = new Set<string>();
-
-  for (let p of matches) {
-    p = p.replace(/\D/g, '');
-    if (p.startsWith('84')) {
-      p = '0' + p.substring(2);
-    }
-    if (p.length === 10) {
-      uniquePhones.add(p);
-    }
-  }
-
-  return Array.from(uniquePhones);
-}
+// P2/P3 — util SĐT dùng chung với telegram-crawler (src/lib/lead-utils.ts).
+// Re-export để code/API cũ import từ facebook-crawler vẫn chạy.
+export { extractVietnamesePhones } from './lead-utils';
 
 /**
  * P2 — Bóc SĐT trực tiếp từ HTML mbasic (reaction/comment/timeline/member pages).
@@ -346,9 +329,7 @@ function harvestPhonesFromHtml(
   html: string,
   saveBatch: (leads: ExtractedLead[]) => number
 ): number {
-  if (!html) return 0;
-  const text = html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
-  const phones = extractVietnamesePhones(text);
+  const phones = minePhonesFromHtml(html);
   if (phones.length === 0) return 0;
   return saveBatch(phones.map(p => ({
     uid: '',

@@ -116,6 +116,7 @@ export async function POST(request: Request) {
           maxLimit,
           autoImport: !!autoImport,
           scrapeType,
+          parallelSessions,
           customTag: customTag ? customTag.trim() : undefined,
           targetCampaignId
         }).catch(err => {
