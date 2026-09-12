@@ -2759,6 +2759,19 @@ export class FacebookAutomation {
         }
       }
       
+      /**
+       * BẰNG CHỨNG ĐĂNG NHẬP (đọc cục bộ, không tốn request):
+       * Cookie `c_user` là dấu hiệu DUY NHẤT đáng tin. Trước đây hàm này kết luận
+       * 'live' chỉ vì "không thấy ô email/password" — sai nghiêm trọng: account đã
+       * mất phiên (chỉ còn cookie 'fr') vẫn bị đánh dấu live, khiến scraper chọn nó
+       * rồi thất bại âm thầm và đổ lỗi sai cho nhóm/mục tiêu (đúng ca job #50).
+       */
+      const authCookies = await context.cookies('https://www.facebook.com').catch(() => []);
+      const hasAuthCookie = authCookies.some(c => c.name === 'c_user' && Boolean(c.value));
+      if (!hasAuthCookie) {
+        console.warn(`[Facebook] @${account.username} KHÔNG có cookie đăng nhập (c_user) — phiên đã hết hạn.`);
+      }
+
       // Navigate to Facebook
       await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(3000);
@@ -2776,10 +2789,17 @@ export class FacebookAutomation {
       const hasEmailInput = await page.$('input[name="email"]');
       const hasPassInput = await page.$('input[name="pass"]');
       
-      if (!hasEmailInput && !hasPassInput) {
-        console.log(`[Facebook] @${account.username} is LIVE`);
+      // CHỈ kết luận 'live' khi CÓ cookie xác thực VÀ không bị chặn bởi form đăng nhập.
+      if (hasAuthCookie && !hasEmailInput && !hasPassInput) {
+        console.log(`[Facebook] @${account.username} is LIVE (có cookie c_user)`);
         await context.close();
         return 'live';
+      }
+      if (!hasAuthCookie && !hasEmailInput && !hasPassInput) {
+        // Không cookie, không form: trang trung gian/chặn — KHÔNG được coi là live.
+        console.warn(`[Facebook] @${account.username}: không có cookie xác thực và không thấy form — coi là cần đăng nhập lại.`);
+        await context.close();
+        return 'die';
       }
       
       if (account.password) {

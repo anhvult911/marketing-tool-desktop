@@ -81,6 +81,19 @@ console.log('— KHOÁ THẬT: process giữ binding native —');
   if (!fs.existsSync(binding)) {
     check('có binding native để test', false, binding);
   } else {
+    /**
+     * Chờ binding rảnh trước khi bắt đầu: nếu chạy ngay sau suite khác, tiến trình node
+     * vừa thoát có thể còn giữ file vài giây → test trước đây chập chờn (pass khi chạy
+     * riêng, fail khi chạy trong chuỗi). Đây là ổn định hoá test, không phải nới lỏng.
+     */
+    const settleDeadline = Date.now() + 20_000;
+    while (Date.now() < settleDeadline && !checkNativeWritable(binding).ok) {
+      execFileSync(process.execPath, ['-e', 'setTimeout(function(){},500)']);
+    }
+    const settledState = checkNativeWritable(binding);
+    check('binding rảnh trước khi test (không bị tiến trình khác giữ)', settledState.ok,
+      settledState.ok ? undefined : `còn bị giữ: ${settledState.code}`);
+
     // Process giả: MỞ DB thật rồi sống mãi. Lưu ý better-sqlite3 v12 nạp binding
     // LAZY — chỉ `require` là chưa map file, phải `new Database()` mới khoá.
     const decoy = spawn(

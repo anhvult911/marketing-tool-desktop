@@ -1130,7 +1130,7 @@ async function extractTimelineEngagement(
 /**
  * Lấy Viewer Account ID (c_user) từ cookie phiên đăng nhập của context
  */
-async function getViewerAccountId(context: BrowserContext): Promise<string> {
+export async function getViewerAccountId(context: BrowserContext): Promise<string> {
   try {
     const cookies = await context.cookies('https://www.facebook.com');
     return cookies.find(c => c.name === 'c_user')?.value || '';
@@ -2943,13 +2943,41 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
         browserContext = launched.context;
         const accountUsername = launched.accountUsername;
 
+        /**
+         * KIỂM TRA PHIÊN CỤC BỘ (không tốn request, không thể sai):
+         * Cookie `c_user` là bằng chứng DUY NHẤT rằng phiên còn đăng nhập. Nếu thiếu,
+         * mọi engine đều vô nghĩa:
+         *   - engine mbasic (nguồn chính của nhóm) cần viewer id → bị bỏ qua âm thầm
+         *   - FB trả trang generic cho khách → DOM gap-fill đọc 0 thành viên
+         *   - thông báo lỗi cuối cùng đổ oan cho NHÓM, trong khi lỗi thật là account
+         *     đã đăng xuất (đúng ca job #50: cả 5 account mất c_user, chỉ còn cookie 'fr')
+         * Vì vậy kiểm tra TRƯỚC khi probe mạng, và coi đây là account cần nạp lại cookie.
+         */
+        const sessionViewerId = await getViewerAccountId(browserContext);
+        if (!sessionViewerId) {
+          const msg = `Account #${accountId} (@${accountUsername}) KHÔNG có cookie đăng nhập (c_user) — phiên đã hết hạn. Cần nạp lại cookie cho account này.`;
+          console.warn(`[FB Scraper] 🔑 ${msg}`);
+          logBlockReasonOnce(`nocookie:${accountId}`, `account:${accountId}`, 'no_session_cookie', msg);
+          jobBlockReasons.push(msg);
+          db.prepare(`
+            UPDATE social_accounts SET status = 'die', last_checked = CURRENT_TIMESTAMP,
+                   cooldown_until = datetime('now', '+20 minutes')
+            WHERE id = ?
+          `).run(accountId);
+          pool.markExhausted(accountId);
+          out.dead = true;
+          await browserContext.close().catch(() => {});
+          return out;
+        }
+
         // Pre-flight login probe (cache 30 phút account vừa xác nhận live)
         let loggedIn = true;
         const accCheck = db.prepare(`SELECT status, last_checked FROM social_accounts WHERE id = ?`).get(accountId) as { status: string; last_checked: string | null } | undefined;
         const lastCheckedMs = parseDbTime(accCheck?.last_checked);
+        // Cache này chỉ AN TOÀN khi cookie đã được xác nhận ở trên (đã qua cổng c_user).
         const isRecentlyLive = accCheck?.status === 'live' && lastCheckedMs > 0 && (Date.now() - lastCheckedMs < 30 * 60 * 1000);
         if (isRecentlyLive) {
-          console.log(`[FB Scraper] ⚡ Account #${accountId} vừa probe 'live' <30p trước — bỏ qua probe.`);
+          console.log(`[FB Scraper] ⚡ Account #${accountId} vừa probe 'live' <30p trước (cookie hợp lệ) — bỏ qua probe.`);
         } else {
           const probe = await probeAccountLogin(browserContext);
           if (!probe.live && probe.decisive) {
@@ -3037,9 +3065,21 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           // account #4 từng bị đánh oan "checkpoint" và bị loại khỏi job, ngay sau đó
           // job vẫn thu 373 leads và account vẫn khoẻ. Chỉ ngắt phiên này, nhường IP.
           if (block.kind === 'login') {
-            console.warn(`[FB Scraper] 🔐 Account #${accountId} gặp login wall (${block.markers.join(',')}) — kết thúc phiên, KHÔNG cooldown account.`);
-            logBlockReasonOnce(`login:${accountId}`, `account:${accountId}`, 'login_wall',
-              `Account @${accountUsername} gặp login wall (${block.markers.join(',')}) — nghi cookie hết hạn. Phiên dừng, account KHÔNG bị cooldown.`);
+            // Login wall = cookie ĐÃ CHẾT (không phải tài khoản bị khoá). Không cooldown
+            // theo kiểu "phạt checkpoint", NHƯNG phải đánh dấu cần nạp lại cookie — nếu chỉ
+            // log rồi để nguyên status='live', account sẽ được chọn lại và lặp vô hạn
+            // (đúng ca job #50: account #2 hit login wall, job vẫn để nó 'live').
+            console.warn(`[FB Scraper] 🔐 Account #${accountId} gặp login wall (${block.markers.join(',')}) — cookie hết hạn, cần nạp lại.`);
+            const msg = `Account @${accountUsername} gặp login wall (${block.markers.join(',')}) — phiên đã hết hạn, cần nạp lại cookie.`;
+            logBlockReasonOnce(`login:${accountId}`, `account:${accountId}`, 'login_wall', msg);
+            jobBlockReasons.push(msg);
+            db.prepare(`
+              UPDATE social_accounts SET status = 'die', last_checked = CURRENT_TIMESTAMP,
+                     cooldown_until = datetime('now', '+20 minutes')
+              WHERE id = ?
+            `).run(accountId);
+            pool.markExhausted(accountId);
+            out.dead = true;
             out.finished = true;
             await closePage();
           } else {
@@ -3104,7 +3144,9 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
               const domLeads = await extractGroupMembersFromDOM(page, currentTarget.cleanUrl, saveLeadBatch, remaining(), cancelSignal);
               out.leads += domLeads;
               if (domLeads === 0) {
-                const reason = `Nhóm ${currentTarget.identifier}: DOM www cũng không đọc được thành viên nào bằng @${accountUsername} (account chưa vào nhóm, hoặc nhóm chặn xem thành viên).`;
+                // Tới đây phiên ĐÃ được xác nhận đăng nhập (đã qua cổng cookie c_user),
+                // nên thông báo nói rõ điều đó và nêu nguyên nhân còn lại thay vì đoán mò.
+                const reason = `Nhóm ${currentTarget.identifier}: account @${accountUsername} đã đăng nhập nhưng không đọc được thành viên nào (engine mbasic + DOM www) — khả năng cao account chưa là thành viên nhóm, hoặc nhóm giới hạn xem danh sách thành viên. Hãy cho account vào nhóm rồi chạy lại.`;
                 jobBlockReasons.push(reason);
                 logBlockReasonOnce(`dom_empty:${targetIdx}`, currentTarget.identifier, 'group_dom_empty', reason);
               }
@@ -3284,13 +3326,18 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
         const sessionMsg = sessionErr instanceof Error ? sessionErr.message : String(sessionErr);
         console.error(`[FB Scraper] Session error Account #${accountId}:`, sessionMsg);
       } finally {
+        // Chốt số đo TRƯỚC khi ghi telemetry: trước đây durationMs được gán SAU khối
+        // finally nên mọi bản ghi đều có duration_ms = 0 (leads/giờ luôn không tính được).
+        out.requests = sessionRequestsUsed;
+        out.http500 = sessionHttp500;
+        out.durationMs = Date.now() - chainStartedAt;
         try {
           db.prepare(`
             INSERT INTO scrape_telemetry (job_id, account_id, engine, requests, leads_new, throttle_events, http_500, duration_ms, first_500_at_request)
             VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
           `).run(
             jobId, accountId, `chain_${task.channel}`,
-            sessionRequestsUsed || 0, out.leads || 0, sessionHttp500 || 0,
+            out.requests || 0, out.leads || 0, out.http500 || 0,
             out.durationMs || 0, out.first500AtRequest || 0
           );
         } catch (telErr: unknown) {
@@ -3310,9 +3357,6 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           try { await browserContext.close(); } catch {}
         }
       }
-      out.requests = sessionRequestsUsed;
-      out.http500 = sessionHttp500;
-      out.durationMs = Date.now() - chainStartedAt;
       return out;
     };
 
