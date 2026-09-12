@@ -59,4 +59,47 @@ if (fs.existsSync(originalWorker)) {
   copyFolderSync(originalWorker, standaloneWorker);
 }
 
+/**
+ * Dọn rác khỏi standalone.
+ *
+ * Vì sao cần: bộ trace (NFT) của Next copy nhầm source/thư mục dữ liệu khi gặp đường
+ * dẫn fs động, VÀ nó không xoá file rác của lần build trước — đã kiểm chứng một file
+ * `.ts` được trace từ 02-09 vẫn còn nguyên trong standalone sau nhiều lần build.
+ * Không dọn thì rác cũ bị đóng gói thẳng vào installer.
+ *
+ * Dùng danh sách CHẶN tường minh (không phải danh sách cho phép) để không có nguy cơ
+ * xoá nhầm thứ runtime cần: giữ nguyên .next, node_modules, public, server.js,
+ * package.json, dist-worker và mọi file khác không nằm trong danh sách.
+ */
+const STANDALONE_JUNK = [
+  'src', 'scripts', 'electron', '.github',
+  'tsconfig.json', 'tsconfig.electron.json', 'tsconfig.tsbuildinfo',
+  'electron-builder.json', 'next.config.ts', 'next-env.d.ts',
+  'MIGRATION_PLAN.md', 'README.md', 'update-policy.json',
+  'marketing.db', 'marketing.db-shm', 'marketing.db-wal',
+  '.env', '.env.example',
+];
+
+function pruneStandalone() {
+  const standaloneRoot = path.join(root, '.next', 'standalone');
+  if (!fs.existsSync(standaloneRoot)) return;
+  const removed = [];
+  for (const entry of STANDALONE_JUNK) {
+    const target = path.join(standaloneRoot, entry);
+    if (!fs.existsSync(target)) continue;
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      removed.push(entry);
+    } catch (err) {
+      // Thường gặp với junction/symlink trên Windows — không chặn build, chỉ cảnh báo.
+      console.warn(`[Build] ⚠️ Không dọn được ${entry} khỏi standalone: ${err.message}`);
+    }
+  }
+  if (removed.length > 0) {
+    console.log(`[Build] 🧹 Đã dọn khỏi standalone: ${removed.join(', ')}`);
+  }
+}
+
+pruneStandalone();
+
 console.log('[Build] ✅ All static assets, worker, native binaries, and runtimes copied successfully to standalone.');

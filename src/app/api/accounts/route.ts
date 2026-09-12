@@ -107,7 +107,9 @@ export async function POST(request: Request) {
             }
           }
           
-          const profilePath = path.join(PROFILES_DIR, `${platform}_${username}`);
+          // turbopackIgnore: thư mục profiles là dữ liệu RUNTIME (ngoài bundle); thiếu đánh dấu
+// sẽ khiến bộ trace của Next glob cả project theo pattern `<dynamic>_<dynamic>`.
+      const profilePath = path.join(/*turbopackIgnore: true*/ PROFILES_DIR, `${platform}_${username}`);
           insertAccountStmt.run(platform, username, password, email, proxyId, profilePath, workspaceId);
           insertedCount++;
         }

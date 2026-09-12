@@ -15,13 +15,16 @@ const LOCK_FILES = ['SingletonLock', 'SingletonSocket', 'SingletonCookie', 'lock
  */
 export function unlockProfileDir(userDataDir: string): number {
   try {
-    if (!userDataDir || !fs.existsSync(userDataDir)) return 0;
+    // turbopackIgnore: userDataDir là thư mục profile trình duyệt lúc chạy (ngoài bundle).
+    // Không đánh dấu, bộ trace của Next sẽ glob cả project theo pattern
+    // `<dynamic>/SingletonLock`, `.../lockfile` → over-bundling.
+    if (!userDataDir || !fs.existsSync(/*turbopackIgnore: true*/ userDataDir)) return 0;
     let removed = 0;
     for (const lf of LOCK_FILES) {
-      const lockPath = path.join(userDataDir, lf);
-      if (fs.existsSync(lockPath)) {
+      const lockPath = path.join(/*turbopackIgnore: true*/ userDataDir, lf);
+      if (fs.existsSync(/*turbopackIgnore: true*/ lockPath)) {
         try {
-          fs.unlinkSync(lockPath);
+          fs.unlinkSync(/*turbopackIgnore: true*/ lockPath);
           removed++;
         } catch {
           // File đang bị lock bởi tiến trình khác
@@ -40,7 +43,7 @@ export function unlockProfileDir(userDataDir: string): number {
  */
 export function killProfileProcesses(userDataDir: string): void {
   try {
-    if (!userDataDir || !fs.existsSync(userDataDir)) return;
+    if (!userDataDir || !fs.existsSync(/*turbopackIgnore: true*/ userDataDir)) return;
     const rawDirName = path.basename(userDataDir);
     // Sanitize nghiêm ngặt chỉ cho phép ký tự an toàn
     const profileDirName = rawDirName.replace(/[^a-zA-Z0-9_\-\.]/g, '');
@@ -79,11 +82,11 @@ export function killProfileProcesses(userDataDir: string): void {
  */
 export function repairProfileForLaunch(userDataDir: string): void {
   try {
-    if (!userDataDir || !fs.existsSync(userDataDir)) return;
+    if (!userDataDir || !fs.existsSync(/*turbopackIgnore: true*/ userDataDir)) return;
     killProfileProcesses(userDataDir);
-    const crashpadSettings = path.join(userDataDir, 'Crashpad', 'settings.dat');
-    if (fs.existsSync(crashpadSettings)) {
-      try { fs.rmSync(crashpadSettings, { force: true }); } catch {}
+    const crashpadSettings = path.join(/*turbopackIgnore: true*/ userDataDir, 'Crashpad', 'settings.dat');
+    if (fs.existsSync(/*turbopackIgnore: true*/ crashpadSettings)) {
+      try { fs.rmSync(/*turbopackIgnore: true*/ crashpadSettings, { force: true }); } catch {}
     }
   } catch {
     // Non-fatal

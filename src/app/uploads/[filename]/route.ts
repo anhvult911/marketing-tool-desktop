@@ -15,25 +15,28 @@ export async function GET(
       return new Response('Tên tệp tin không hợp lệ.', { status: 400 });
     }
     
-    const safeUploadsDir = path.resolve(UPLOADS_DIR);
-    let filePath = path.resolve(safeUploadsDir, safeFilename);
+    // turbopackIgnore: thư mục uploads là dữ liệu RUNTIME (APPDATA khi đóng gói,
+    // public/uploads khi dev) — không phải asset của bundle. Thiếu đánh dấu, bộ trace
+    // của Next mở rộng pattern tới cả project và copy nhầm toàn bộ source vào bản đóng gói.
+    const safeUploadsDir = path.resolve(/*turbopackIgnore: true*/ UPLOADS_DIR);
+    let filePath = path.resolve(/*turbopackIgnore: true*/ safeUploadsDir, safeFilename);
 
     if (!filePath.startsWith(safeUploadsDir)) {
       return new Response('Truy cập bị từ chối.', { status: 403 });
     }
 
-    if (!fs.existsSync(filePath)) {
+    if (!fs.existsSync(/*turbopackIgnore: true*/ filePath)) {
       // Fallback kiểm tra thư mục public/uploads
-      const safePublicDir = path.resolve(process.cwd(), 'public', 'uploads');
-      const fallbackPath = path.resolve(safePublicDir, safeFilename);
-      if (fallbackPath.startsWith(safePublicDir) && fs.existsSync(fallbackPath)) {
+      const safePublicDir = path.resolve(/*turbopackIgnore: true*/ process.cwd(), 'public', 'uploads');
+      const fallbackPath = path.resolve(/*turbopackIgnore: true*/ safePublicDir, safeFilename);
+      if (fallbackPath.startsWith(safePublicDir) && fs.existsSync(/*turbopackIgnore: true*/ fallbackPath)) {
         filePath = fallbackPath;
       } else {
         return new Response('Không tìm thấy tệp tin.', { status: 404 });
       }
     }
 
-    const fileBuffer = fs.readFileSync(filePath);
+    const fileBuffer = fs.readFileSync(/*turbopackIgnore: true*/ filePath);
     
     // Determine the correct Content-Type based on file extension
     let contentType = 'application/octet-stream';

@@ -433,7 +433,9 @@ async function setupStealthBrowserContext(accountId?: number, proxyOverride?: { 
 
     if (acc) {
       username = acc.username || `Account_${acc.id}`;
-      if (acc.user_data_dir && fs.existsSync(acc.user_data_dir)) {
+      // turbopackIgnore: profile dir của account là dữ liệu RUNTIME (ngoài bundle);
+      // không đánh dấu sẽ khiến bộ trace của Next glob cả project.
+      if (acc.user_data_dir && fs.existsSync(/*turbopackIgnore: true*/ acc.user_data_dir)) {
         profileDir = acc.user_data_dir;
         unlockProfileDir(profileDir);
       }
@@ -513,7 +515,7 @@ async function setupStealthBrowserContext(accountId?: number, proxyOverride?: { 
   let context: BrowserContext;
   let isPersistent = false;
 
-  if (profileDir && fs.existsSync(profileDir)) {
+  if (profileDir && fs.existsSync(/*turbopackIgnore: true*/ profileDir)) {
     context = await launchRobustPersistentContext(profileDir, {
       headless: true,
       viewport: { width: 1366, height: 768 },

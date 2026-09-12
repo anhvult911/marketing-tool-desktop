@@ -20,11 +20,11 @@ export async function GET(request: Request) {
     const zip = new AdmZip();
 
     // 1. Sao lưu file CSDL SQLite mkt.db
-    if (fs.existsSync(DB_PATH)) {
+    if (fs.existsSync(/*turbopackIgnore: true*/ DB_PATH)) {
       try {
         // Sử dụng lệnh checkpoint WAL của SQLite trước khi đọc để đảm bảo dữ liệu mới nhất
         db.pragma('wal_checkpoint(TRUNCATE)');
-        const dbBuffer = fs.readFileSync(DB_PATH);
+        const dbBuffer = fs.readFileSync(/*turbopackIgnore: true*/ DB_PATH);
         zip.addFile('mkt.db', dbBuffer);
       } catch (dbErr: any) {
         console.warn('[Full Backup] Không thể đọc trực tiếp mkt.db:', dbErr.message);
@@ -32,14 +32,14 @@ export async function GET(request: Request) {
     }
 
     // 2. Sao lưu các phiên đăng nhập (profiles)
-    if (fs.existsSync(PROFILES_DIR)) {
-      const items = fs.readdirSync(PROFILES_DIR);
+    if (fs.existsSync(/*turbopackIgnore: true*/ PROFILES_DIR)) {
+      const items = fs.readdirSync(/*turbopackIgnore: true*/ PROFILES_DIR);
       for (const item of items) {
         if (item === 'screenshots' || item.endsWith('.tmp') || item.startsWith('.')) continue;
 
         const itemPath = path.join(/*turbopackIgnore: true*/ PROFILES_DIR, item);
         try {
-          const stat = fs.statSync(itemPath);
+          const stat = fs.statSync(/*turbopackIgnore: true*/ itemPath);
           if (stat.isDirectory()) {
             zip.addLocalFolder(itemPath, `profiles/${item}`);
           }
@@ -94,7 +94,7 @@ export async function POST(request: NextRequest) {
       try {
         const dbData = dbEntry.getData();
         // Ghi đè file CSDL
-        fs.writeFileSync(DB_PATH, dbData);
+        fs.writeFileSync(/*turbopackIgnore: true*/ DB_PATH, dbData);
         hasDatabase = true;
       } catch (dbErr: any) {
         console.error('[Restore Error] Ghi đè CSDL thất bại:', dbErr.message);
@@ -102,11 +102,11 @@ export async function POST(request: NextRequest) {
     }
 
     // 2. Phục hồi thư mục profiles
-    if (!fs.existsSync(PROFILES_DIR)) {
-      fs.mkdirSync(PROFILES_DIR, { recursive: true });
+    if (!fs.existsSync(/*turbopackIgnore: true*/ PROFILES_DIR)) {
+      fs.mkdirSync(/*turbopackIgnore: true*/ PROFILES_DIR, { recursive: true });
     }
 
-    const safeBaseDir = path.resolve(PROFILES_DIR);
+    const safeBaseDir = path.resolve(/*turbopackIgnore: true*/ PROFILES_DIR);
 
     for (const entry of zipEntries) {
       if (entry.entryName.startsWith('profiles/') && !entry.isDirectory) {

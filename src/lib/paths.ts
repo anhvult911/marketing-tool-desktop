@@ -38,8 +38,12 @@ export const LOGS_DIR = path.join(USER_DATA_DIR, 'logs');
 export function ensureAppDirectories() {
   [USER_DATA_DIR, PROFILES_DIR, UPLOADS_DIR, DB_DIR, LOGS_DIR].forEach((dir) => {
     try {
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      // turbopackIgnore: đây là thư mục DỮ LIỆU RUNTIME (APPDATA khi đóng gói, thư mục
+      // dự án khi dev), KHÔNG phải asset của bundle. Thiếu đánh dấu này, bộ trace của
+      // Next không giải được biến `dir` nên mở rộng thành pattern khớp cả project
+      // (~15.5k file) → cảnh báo over-bundling và copy nhầm toàn bộ source vào bản đóng gói.
+      if (!fs.existsSync(/*turbopackIgnore: true*/ dir)) {
+        fs.mkdirSync(/*turbopackIgnore: true*/ dir, { recursive: true });
       }
     } catch (e: any) {
       console.warn(`[Paths] Không thể tạo thư mục ${dir}:`, e.message);

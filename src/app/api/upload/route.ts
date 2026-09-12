@@ -26,8 +26,9 @@ export async function POST(request: Request) {
     const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
     const uploadDir = UPLOADS_DIR;
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
+    // turbopackIgnore: thư mục uploads là dữ liệu RUNTIME, không phải asset của bundle.
+    if (!fs.existsSync(/*turbopackIgnore: true*/ uploadDir)) {
+      fs.mkdirSync(/*turbopackIgnore: true*/ uploadDir, { recursive: true });
     }
 
     const savedPaths: string[] = [];
@@ -56,9 +57,9 @@ export async function POST(request: Request) {
       // Generate a unique safe filename
       const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
       const filename = `${uniqueSuffix}${ext}`;
-      const filePath = path.join(uploadDir, filename);
+      const filePath = path.join(/*turbopackIgnore: true*/ uploadDir, filename);
 
-      fs.writeFileSync(filePath, buffer);
+      fs.writeFileSync(/*turbopackIgnore: true*/ filePath, buffer);
       savedPaths.push(`/uploads/${filename}`);
     }
 
