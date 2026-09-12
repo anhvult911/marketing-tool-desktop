@@ -1,15 +1,21 @@
 /**
- * IP REGISTRY — quản lý "IP thật" thay vì "proxy row".
+ * IP REGISTRY — quản lý danh tính IP của session, dựa trên IP ĐO THẬT.
  *
- * Vì sao cần: nhiều row trong bảng `proxies` có thể trỏ CÙNG một host (đo trên máy
- * thật: 5 row nhưng chỉ 3 IP; 3 account dùng chung 103.179.188.222). Nếu chỉ lease
- * theo proxy_id thì 3 row cùng IP bị coi là 3 IP khác nhau → nhiều session từ một IP
- * chạy đồng thời → Facebook thấy "nhiều tài khoản, một IP" → checkpoint hàng loạt.
+ * BÀI HỌC ĐO ĐƯỢC (script tmp-proxy-exit-ip.ts, chạy thật trên máy này):
+ *   proxy #2 103.179.188.222:27305 → 118.68.29.31
+ *   proxy #3 103.179.188.222:27321 → 118.68.233.185
+ *   proxy #4 103.179.188.222:25975 → 1.55.226.226
+ * Cùng host, khác port → KHÁC IP đầu ra. Vậy KHÔNG được dùng `host` làm danh tính
+ * (phiên bản đầu của module này đã làm vậy và siết nhầm 5 IP xuống còn 2).
+ * Cũng KHÔNG nên suy đoán `host:port` — đó vẫn là giả định về cách provider làm việc.
+ *
+ * Cách đúng: đo IP đầu ra thật rồi lưu vào `proxies.exit_ip`, dùng nó làm danh tính.
+ * Khi chưa đo được thì tạm dùng host:port (an toàn hơn host trần vì mỗi port là một
+ * session riêng ở phần lớn provider), và lần đo kế tiếp sẽ thay bằng số thật.
  *
  * Hai luật cốt lõi:
- *   1. Khoá danh tính là `host` (IP), KHÔNG phải proxy_id.
- *   2. Mỗi IP chỉ cho phép 1 session đồng thời trên toàn hệ thống. Không có ngoại lệ
- *      cho "proxy mặc định của account" — trùng IP là trùng IP.
+ *   1. Danh tính = exit_ip nếu đã đo, ngược lại host:port. Không bao giờ chỉ dùng proxy_id.
+ *   2. Mỗi danh tính chỉ cho 1 session đồng thời. Không ngoại lệ cho proxy mặc định.
  *
  * Pure logic (nhận dữ liệu, không tự query DB) → unit-test được.
  */
@@ -18,9 +24,14 @@
 export interface ProxyEndpoint {
   /** id row trong bảng proxies (để set cooldown khi checkpoint) */
   proxyId: number;
-  /** IP/host thật — danh tính dùng cho mọi quyết định độc quyền */
+  /** host gateway của provider (KHÔNG phải IP đầu ra) */
   host: string;
   port: number;
+  /**
+   * IP ĐẦU RA THẬT, đo bằng truy vấn công khai (proxies.exit_ip).
+   * Có giá trị → đây là danh tính. Chưa đo → dùng host:port làm danh tính tạm.
+   */
+  exitIp?: string | null;
   username?: string;
   password?: string;
   protocol?: string;
@@ -43,9 +54,17 @@ export function normalizeIpKey(host: string | null | undefined): string {
   return h || 'direct';
 }
 
-/** Khoá IP của proxy row. */
+/**
+ * Danh tính IP của một proxy.
+ * Thứ tự: exit_ip đã đo → host:port (mỗi port thường là một session/IP riêng).
+ * TUYỆT ĐỐI không dùng host trần: đo thực tế cho thấy cùng host ra nhiều IP.
+ */
 export function proxyIpKey(proxy: ProxyEndpoint): string {
-  return normalizeIpKey(proxy.host);
+  const measured = String(proxy.exitIp || '').trim().toLowerCase();
+  if (measured) return measured;
+  const host = String(proxy.host || '').trim().toLowerCase();
+  if (!host) return 'direct';
+  return `${host}:${proxy.port}`;
 }
 
 /**

@@ -22,7 +22,8 @@
     "build": "npm run build:electron && npm run build:worker && npm run build:next",
     "dist": "npm run build && electron-builder --win --publish never",
     "rebuild:dev": "npm rebuild better-sqlite3",
-    "lint": "eslint"
+    "lint": "eslint",
+    "verify:proxy-ip": "tsx scripts/verify-proxy-ip.ts"
   },
   "dependencies": {
     "adm-zip": "^0.6.0",

@@ -2768,26 +2768,27 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
      * tăng sản lượng) trong khi làm tăng rủi ro nếu luật độc quyền IP bị hở.
      */
     const accountProxyRows = db.prepare(`
-      SELECT a.id as account_id, a.proxy_id, p.host, p.port, p.username, p.password, p.protocol
+      SELECT a.id as account_id, a.proxy_id, p.host, p.port, p.username, p.password, p.protocol,
+             p.exit_ip, p.exit_ip_checked_at
       FROM social_accounts a LEFT JOIN proxies p ON a.proxy_id = p.id
       WHERE a.id IN (${accountQueue.map(() => '?').join(',')})
-    `).all(...accountQueue) as Array<{ account_id: number; proxy_id: number | null; host: string | null; port: number | null; username: string | null; password: string | null; protocol: string | null }>;
+    `).all(...accountQueue) as Array<{ account_id: number; proxy_id: number | null; host: string | null; port: number | null; username: string | null; password: string | null; protocol: string | null; exit_ip: string | null; exit_ip_checked_at: string | null }>;
     const accountProxyById = new Map<number, ProxyEndpoint | null>();
     const distinctIps = new Set<string>();
     for (const row of accountProxyRows) {
       const ep: ProxyEndpoint | null = row.proxy_id && row.host && row.port
-        ? { proxyId: row.proxy_id, host: row.host, port: row.port, username: row.username || undefined, password: row.password || undefined, protocol: row.protocol || 'http' }
+        ? { proxyId: row.proxy_id, host: row.host, port: row.port, exitIp: row.exit_ip, username: row.username || undefined, password: row.password || undefined, protocol: row.protocol || 'http' }
         : null;
       accountProxyById.set(row.account_id, ep);
       distinctIps.add(ep ? proxyIpKey(ep) : 'direct');
     }
     const spareProxyRows = db.prepare(`
-      SELECT id, host, port, username, password, protocol FROM proxies
+      SELECT id, host, port, username, password, protocol, exit_ip FROM proxies
       WHERE status = 'working' AND id NOT IN (SELECT COALESCE(proxy_id, -1) FROM social_accounts)
       ORDER BY id ASC
-    `).all() as Array<{ id: number; host: string; port: number; username: string | null; password: string | null; protocol: string | null }>;
+    `).all() as Array<{ id: number; host: string; port: number; username: string | null; password: string | null; protocol: string | null; exit_ip: string | null }>;
     const spareProxies: ProxyEndpoint[] = spareProxyRows.map(r => ({
-      proxyId: r.id, host: r.host, port: r.port,
+      proxyId: r.id, host: r.host, port: r.port, exitIp: r.exit_ip,
       username: r.username || undefined, password: r.password || undefined, protocol: r.protocol || 'http',
     }));
 
@@ -2804,10 +2805,17 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       `${configuredSlots < requestedSlots ? ` (đã hạ từ ${requestedSlots} theo ${distinctIps.size} IP khả dụng)` : ''}` +
       `, ${targetList.length} target (kênh hybrid).`
     );
+    const unmeasured = accountProxyRows.filter(r => r.proxy_id && !r.exit_ip).length;
+    if (unmeasured > 0) {
+      console.warn(
+        `[FB Scraper] ⚠️ ${unmeasured} proxy chưa đo IP đầu ra thật — đang tạm dùng host:port làm danh tính. ` +
+        `Chạy "npm run verify:proxy-ip" để đo, tránh 2 account vô tình trùng IP.`
+      );
+    }
     if (distinctIps.size < accountQueue.length) {
       console.warn(
         `[FB Scraper] ⚠️ ${accountQueue.length} account nhưng chỉ ${distinctIps.size} IP riêng — ` +
-        `${accountQueue.length - distinctIps.size} account sẽ dùng chung IP. ` +
+        `${accountQueue.length - distinctIps.size} account phải dùng chung IP. ` +
         `Đây là nguyên nhân checkpoint hàng loạt; nạp thêm proxy riêng cho từng account.`
       );
     }

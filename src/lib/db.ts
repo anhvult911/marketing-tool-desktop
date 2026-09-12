@@ -311,6 +311,19 @@ export function initDatabaseSchema() {
       db.exec(`CREATE INDEX IF NOT EXISTS idx_spam_leads_norm ON spam_leads(workspace_id, normalized_value)`);
     }
 
+    // Tầng 1 (sửa lại) — IP ĐẦU RA THẬT của proxy, đo bằng truy vấn công khai.
+    // Không thể suy ra từ host: đo thực tế cho thấy cùng host 103.179.188.222 với 3 port
+    // khác nhau ra 3 IP khác nhau (118.68.29.31 / 118.68.233.185 / 1.55.226.226).
+    // Dùng host làm danh tính là SAI; dùng host:port cũng chỉ là suy đoán.
+    const proxiesInfo = db.prepare(`PRAGMA table_info(proxies)`).all() as any[];
+    const proxyColNames = proxiesInfo.map(c => c.name);
+    if (!proxyColNames.includes('exit_ip')) {
+      db.exec(`ALTER TABLE proxies ADD COLUMN exit_ip TEXT`);
+    }
+    if (!proxyColNames.includes('exit_ip_checked_at')) {
+      db.exec(`ALTER TABLE proxies ADD COLUMN exit_ip_checked_at DATETIME`);
+    }
+
     const targetsInfo = db.prepare(`PRAGMA table_info(scrape_targets)`).all() as any[];
     const targetCols = targetsInfo.map(c => c.name);
     if (!targetCols.includes('last_scraped_id')) {
