@@ -236,6 +236,11 @@ export function initDatabaseSchema() {
     if (!socialColNames.includes('cooldown_until')) {
       db.exec(`ALTER TABLE social_accounts ADD COLUMN cooldown_until DATETIME`);
     }
+    // Tầng 2 — Warm-up account mới: account vừa nạp cookie mà cào mạnh ngay rất dễ
+    // checkpoint. Theo dõi số phiên THÀNH CÔNG để biết account đã "đủ tuổi" vào pool chính.
+    if (!socialColNames.includes('warmup_sessions')) {
+      db.exec(`ALTER TABLE social_accounts ADD COLUMN warmup_sessions INTEGER DEFAULT 0`);
+    }
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS scrape_telemetry (

@@ -7,6 +7,7 @@ import { normalizeLeadValue } from './lead-normalize';
 import { scrapeLimiter, ConcurrencyLimiter } from './concurrency';
 import { ScrapeAccountPool } from './scrape-pool';
 import { ScrapeTaskBoard } from './scrape-tasks';
+import { IpRegistry, chooseIpForSession, maxSafeSessions, proxyIpKey, type ProxyEndpoint } from './ip-registry';
 import { summarizeByAccount, recommendPacing, withinWindow, TelemetryRow } from './scrape-telemetry';
 import type { ClaimedTask } from './scrape-tasks';
 import { sendDesktopNotification } from './notify';
@@ -342,24 +343,103 @@ function harvestPhonesFromHtml(
 }
 
 /**
- * Check if the current page has hit Facebook Checkpoint, Lock or Temporary Block
+ * Kết quả phân loại tình trạng trang: phân biệt rõ 3 mức vì hậu quả khác nhau.
+ *
+ * Đo trên máy thật: account #4 bị log "checkpoint" và bị loại khỏi job, nhưng job vẫn
+ * thu 373 leads và account vẫn khoẻ. Nguyên nhân: các phép khớp CHUỖI THÔ:
+ *   - html.includes('login_form')  → khớp cả tên biến JS vô hại
+ *   - html.includes('checkpoint')  → khớp cả markup/khoá JS bình thường
+ *   - url.includes('login')        → khớp cả query param  (?ref=login)
+ *   - url.includes('disabled')     → khớp cả query param  (?disabled=1)
+ * Báo oan checkpoint khiến account bị cooldown 60' và bị loại khỏi pool — mất nguồn
+ * lực đúng lúc đang chạy tốt, đồng thời làm nhiễu mọi thống kê sức khoẻ.
+ */
+export type BlockKind = 'none' | 'login' | 'checkpoint';
+
+export interface BlockAssessment {
+  kind: BlockKind;
+  markers: string[];
+}
+
+/** True nếu path (không tính query) chứa segment khớp chính xác. */
+function pathHasSegment(rawUrl: string, segments: string[]): boolean {
+  try {
+    const u = new URL(rawUrl);
+    const parts = u.pathname.toLowerCase().split('/').filter(Boolean);
+    return parts.some(p => segments.includes(p));
+  } catch {
+    return false;
+  }
+}
+
+/** Đích chuyển hướng đăng nhập thật của Facebook. */
+function isLoginRedirect(rawUrl: string): boolean {
+  try {
+    const u = new URL(rawUrl);
+    const path = u.pathname.toLowerCase();
+    const host = u.hostname.toLowerCase();
+    if (!host.includes('facebook.com')) return false;
+    if (path === '/login.php' || path === '/login' || path.startsWith('/login/')) return true;
+    // /checkpoint/ là trang xác minh danh tính — mức nặng hơn login
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Đánh giá tình trạng trang trả về. Chỉ kết luận khi có dấu hiệu ĐỦ CỤ THỂ:
+ * mẫu câu tiếng Việt/Anh đầy đủ, hoặc redirect tới đúng /login.php.
+ * Cố tình KHÔNG dùng `includes('checkpoint')` / `includes('login')` trần.
+ */
+export function assessBlock(rawUrl: string, pageContent: string): BlockAssessment {
+  const url = String(rawUrl || '');
+  const text = String(pageContent || '').toLowerCase();
+  const markers: string[] = [];
+
+  // ── Checkpoint (nặng: tài khoản bị khoá/xác minh) ──
+  if (pathHasSegment(url, ['checkpoint'])) markers.push('url:/checkpoint/');
+  const checkpointPhrases = [
+    'tài khoản của bạn tạm thời bị khóa',
+    'tài khoản của bạn đã bị khóa',
+    'bạn tạm thời bị chặn',
+    'vui lòng xác nhận danh tính',
+    'xác nhận danh tính của bạn',
+    'you’re temporarily blocked',
+    "you're temporarily blocked",
+    'confirm your identity',
+    'hành động bị chặn',
+    'action blocked',
+    'we suspended your account',
+  ];
+  for (const p of checkpointPhrases) {
+    if (text.includes(p)) { markers.push(`text:${p}`); break; }
+  }
+  if (markers.length > 0) return { kind: 'checkpoint', markers };
+
+  // ── Login wall (nhẹ: phiên hỏng, KHÔNG phải tài khoản bị khoá) ──
+  if (isLoginRedirect(url)) markers.push('url:redirect-login');
+  const loginPhrases = [
+    'đăng nhập vào facebook',
+    'log in to facebook',
+    'log into facebook',
+    'bạn phải đăng nhập',
+    'you must log in',
+  ];
+  for (const p of loginPhrases) {
+    if (text.includes(p)) { markers.push(`text:${p}`); break; }
+  }
+  if (markers.length > 0) return { kind: 'login', markers };
+
+  return { kind: 'none', markers: [] };
+}
+
+/**
+ * Giữ API cũ cho tương thích: true khi trang là checkpoint THẬT (không tính login wall).
+ * Caller cũ dùng hàm này để quyết định cooldown account — nay chỉ checkpoint mới đủ nặng.
  */
 export function detectFacebookCheckpoint(url: string, pageContent: string): boolean {
-  if (url.includes('/checkpoint/') || url.includes('login') || url.includes('disabled') || url.includes('temporarily_blocked')) {
-    return true;
-  }
-  const text = (pageContent || '').toLowerCase();
-  if (
-    text.includes('tài khoản của bạn tạm thời bị khóa') ||
-    text.includes('bạn tạm thời bị chặn') ||
-    text.includes('you’re temporarily blocked') ||
-    text.includes('vui lòng xác nhận danh tính') ||
-    text.includes('confirm your identity') ||
-    text.includes('hành động bị chặn')
-  ) {
-    return true;
-  }
-  return false;
+  return assessBlock(url, pageContent).kind === 'checkpoint';
 }
 
 /**
@@ -2135,6 +2215,12 @@ export async function harvestFollowersByCursor(
   // P5 — telemetry account có thể siết lên (500 nhiều) nhưng không bao giờ dưới sàn.
   let pacingMs = Math.max(3000, Math.min(8000, initialPacingMs || 3200));
   let requestCount = 0;
+  // TẦNG 2 — Hằng số đo thực: FB trả HTTP 500 ở khoảng request thứ 18 vì chuỗi phân
+  // trang cạn (đo bg_1: req 0-17 OK, req 18 = 500). Cố chạm 18 để "lấy thêm 1 trang"
+  // chính là lúc kích hoạt tín hiệu chặn — sau đó IP+session bị gắn cờ.
+  // Chủ động dừng ở 15 (biên an toàn 3 request), giữ cursor, nhường IP.
+  const chainSlotLimit = 15;
+  let hitsChainLimit = false;
   // FB dùng key cursor không thống nhất giữa các query: 'cursor' phổ biến,
   // một số query dùng 'after' / 'afterCursor'. Thử tuần tự khi key hiện tại không tiến.
   const cursorKeys: string[] = ['cursor', 'after'];
@@ -2158,6 +2244,12 @@ export async function harvestFollowersByCursor(
   while (newLeads < maxLeads && !cancelSignal.cancelled) {
     if (page.isClosed()) return { newLeads, nextCursor: currentCursor, ended: 'error', http500: http500Count, first500AtRequest };
     if (requestBudget.remaining <= 0) return { newLeads, nextCursor: currentCursor, ended: 'budget', http500: http500Count, first500AtRequest };
+    // TẦNG 2 — dừng TRƯỚC ngưỡng 500 của FB, giữ cursor để chain kế tiếp (IP khác) resume.
+    if (requestCount >= chainSlotLimit) {
+      hitsChainLimit = true;
+      console.log(`[Followers Cursor] 🛡️ Dừng chủ động ở ${requestCount} request (ngưỡng FB ~18) — giữ cursor, nhường IP.`);
+      return { newLeads, nextCursor: currentCursor, ended: 'chain-limit', http500: http500Count, first500AtRequest };
+    }
     if (reqSinceLead >= 3 && capture.cursor && capture.cursor !== currentCursor) {
       console.log(`[Followers Cursor] Cursor resume chết — chuyển sang cursor tươi từ trang.`);
       currentCursor = capture.cursor;
@@ -2442,6 +2534,33 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     const targetList = targetGroup.split(/[\n,]+/).map((t: string) => t.trim()).filter(Boolean);
     const parsedTarget = parseFacebookTarget(targetList[0] || targetGroup);
     const targetTag = customTag && customTag.trim() ? customTag.trim() : `KOL_${parsedTarget.identifier}`;
+
+    /**
+     * TẦNG 2 — Lịch sử yield của target: nếu target này đã cào nhiều lần mà thu rất ít,
+     * chạy lại chỉ đốt account + IP mà gần như không thêm lead (đo thật: job 36/37 chỉ
+     * 16 và 40 lead, tiếp tục chạy thêm nhiều lượt nữa). Cảnh báo rõ để người dùng quyết
+     * định, KHÔNG tự chặn (có thể target vừa đổi nội dung).
+     */
+    const priorRuns = db.prepare(`
+      SELECT COUNT(*) runs, COALESCE(SUM(scraped_count), 0) leads
+      FROM scrape_jobs
+      WHERE workspace_id = ? AND platform = 'facebook'
+        AND target_group = ? AND status = 'completed'
+    `).get(workspaceId, targetList.join('\n')) as { runs: number; leads: number } | undefined;
+    if (priorRuns && priorRuns.runs >= 2) {
+      const avg = Math.round(priorRuns.leads / priorRuns.runs);
+      if (avg < 50) {
+        console.warn(
+          `[FB Scraper] ⚠️ Target này đã cào ${priorRuns.runs} lần, trung bình chỉ ${avg} lead/lần ` +
+          `(tổng ${priorRuns.leads}). Nhiều khả năng đã cạn lead hoặc bị FB hạn chế xem — ` +
+          `cân nhắc đổi target thay vì chạy lại, tránh đốt account.`
+        );
+        try {
+          db.prepare(`INSERT INTO crawler_logs (workspace_id, target_value, action_type, message) VALUES (?, ?, 'low_yield_target', ?)`)
+            .run(workspaceId, targetList[0] || targetGroup, `Target đã cào ${priorRuns.runs} lần, trung bình ${avg} lead/lần — nên đổi target.`);
+        } catch { /* log lỗi không chặn job */ }
+      }
+    }
     let targetFollowerCount = (db.prepare(`SELECT target_follower_count FROM scrape_jobs WHERE id = ?`).get(jobId) as { target_follower_count: number | null } | undefined)?.target_follower_count || 0;
 
     // Atomic qua transaction: an toàn khi nhiều account worker gọi đồng thời
@@ -2568,6 +2687,15 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       const v = Date.parse(t);
       return isNaN(v) ? 0 : v;
     };
+    /**
+     * TẦNG 2 — Warm-up: account chưa chạy thành công đủ số phiên thì bị giới hạn
+     * (quota nhỏ + nghỉ dài). Đo trên máy thật: account vừa nạp cookie rồi cào mạnh
+     * ngay là nhóm bị checkpoint sớm nhất.
+     */
+    const WARMUP_SESSIONS_REQUIRED = 2;
+    const WARMUP_QUOTA_MULTIPLIER = 0.4;
+    const CHAIN_SLOT_LIMIT_GLOBAL = 15;
+
     const accountEligible = (a: { id: number; daily_request_count: number | null; daily_reset_at: string | null; cooldown_until: string | null }): boolean => {
       if (a.cooldown_until) {
         const until = parseDbTime(a.cooldown_until);
@@ -2628,11 +2756,42 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     }
 
     // ── P2: pool account + slot semaphore + task board kênh song song ──
-    const configuredSlots = Math.max(1, Math.min(6,
+    const requestedSlots = Math.max(1, Math.min(6,
       options.parallelSessions && options.parallelSessions > 0
         ? options.parallelSessions
         : parseInt(getSetting('max_scrape_sessions', '3'), 10) || 3
     ));
+
+    /**
+     * TẦNG 1 — Số session song song bị chặn bởi SỐ IP THẬT, không phải số account.
+     * Chạy nhiều session hơn số IP khả dụng chỉ tạo ra session xếp hàng chờ (không
+     * tăng sản lượng) trong khi làm tăng rủi ro nếu luật độc quyền IP bị hở.
+     */
+    const accountProxyRows = db.prepare(`
+      SELECT a.id as account_id, a.proxy_id, p.host, p.port, p.username, p.password, p.protocol
+      FROM social_accounts a LEFT JOIN proxies p ON a.proxy_id = p.id
+      WHERE a.id IN (${accountQueue.map(() => '?').join(',')})
+    `).all(...accountQueue) as Array<{ account_id: number; proxy_id: number | null; host: string | null; port: number | null; username: string | null; password: string | null; protocol: string | null }>;
+    const accountProxyById = new Map<number, ProxyEndpoint | null>();
+    const distinctIps = new Set<string>();
+    for (const row of accountProxyRows) {
+      const ep: ProxyEndpoint | null = row.proxy_id && row.host && row.port
+        ? { proxyId: row.proxy_id, host: row.host, port: row.port, username: row.username || undefined, password: row.password || undefined, protocol: row.protocol || 'http' }
+        : null;
+      accountProxyById.set(row.account_id, ep);
+      distinctIps.add(ep ? proxyIpKey(ep) : 'direct');
+    }
+    const spareProxyRows = db.prepare(`
+      SELECT id, host, port, username, password, protocol FROM proxies
+      WHERE status = 'working' AND id NOT IN (SELECT COALESCE(proxy_id, -1) FROM social_accounts)
+      ORDER BY id ASC
+    `).all() as Array<{ id: number; host: string; port: number; username: string | null; password: string | null; protocol: string | null }>;
+    const spareProxies: ProxyEndpoint[] = spareProxyRows.map(r => ({
+      proxyId: r.id, host: r.host, port: r.port,
+      username: r.username || undefined, password: r.password || undefined, protocol: r.protocol || 'http',
+    }));
+
+    const configuredSlots = maxSafeSessions(distinctIps.size, requestedSlots);
     const pool = new ScrapeAccountPool(accountQueue);
     const slots = new ConcurrencyLimiter(configuredSlots);
     const board = new ScrapeTaskBoard(
@@ -2640,7 +2799,18 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       { scrapeType }
     );
 
-    console.log(`[FB Scraper] Job #${jobId} pool: ${accountQueue.length} account, ${configuredSlots} slot song song, ${targetList.length} target (kênh hybrid).`);
+    console.log(
+      `[FB Scraper] Job #${jobId} pool: ${accountQueue.length} account, ${configuredSlots} slot song song` +
+      `${configuredSlots < requestedSlots ? ` (đã hạ từ ${requestedSlots} theo ${distinctIps.size} IP khả dụng)` : ''}` +
+      `, ${targetList.length} target (kênh hybrid).`
+    );
+    if (distinctIps.size < accountQueue.length) {
+      console.warn(
+        `[FB Scraper] ⚠️ ${accountQueue.length} account nhưng chỉ ${distinctIps.size} IP riêng — ` +
+        `${accountQueue.length - distinctIps.size} account sẽ dùng chung IP. ` +
+        `Đây là nguyên nhân checkpoint hàng loạt; nạp thêm proxy riêng cho từng account.`
+      );
+    }
 
     // CD3: trần chuỗi thật của FB / account / chain — vượt chỉ mời 500
     const maxPerAccountQuota = 150;
@@ -2652,29 +2822,13 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
     };
 
     /**
-     * Spare proxy lease — ĐỘC QUYỀN trong pool: 2 session song song không bao giờ
-     * dùng chung 1 proxy. Cạn spare → session dùng proxy mặc định của chính account.
+     * TẦNG 1 — Sổ đăng ký IP thật: MỘT IP = TỐI ĐA MỘT SESSION.
+     *
+     * Trước đây lease theo proxy.id nên 3 row cùng host (103.179.188.222) bị coi là
+     * 3 IP khác nhau → 3 session/1 IP trong 17 giây → checkpoint hàng loạt.
+     * Nay danh tính là `host`, và không có ngoại lệ cho proxy mặc định của account.
      */
-    const leasedProxyIds = new Set<number>();
-    const pickSpareProxy = (accountId: number): { proxyId: number; host: string; port: number; username?: string; password?: string; protocol?: string } | undefined => {
-      try {
-        const acc = db.prepare(`SELECT proxy_id FROM social_accounts WHERE id = ?`).get(accountId) as { proxy_id: number | null } | undefined;
-        const rows = db.prepare(`
-          SELECT id, host, port, username, password, protocol FROM proxies
-          WHERE status = 'working' AND id NOT IN (
-            SELECT COALESCE(proxy_id, -1) FROM social_accounts
-          )
-          ORDER BY id ASC
-        `).all() as Array<{ id: number; host: string; port: number; username: string | null; password: string | null; protocol: string | null }>;
-        const available = rows.filter(r => r.id !== acc?.proxy_id && !leasedProxyIds.has(r.id));
-        if (available.length === 0) return undefined;
-        const chosen = available[Math.floor(Math.random() * available.length)];
-        leasedProxyIds.add(chosen.id);
-        return { proxyId: chosen.id, host: chosen.host, port: chosen.port, username: chosen.username || undefined, password: chosen.password || undefined, protocol: chosen.protocol || 'http' };
-      } catch {
-        return undefined;
-      }
-    };
+    const ipRegistry = new IpRegistry();
 
     /** Ghi crawler_logs 1 lần cho mỗi (khoá) — tránh spam khi nhiều chain cùng lý do. */
     const loggedBlockKeys = new Set<string>();
@@ -2740,18 +2894,38 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
       dead: boolean;
       throttled: boolean;
       finished: boolean;
+      /** Tầng 1: không giành được IP rảnh → session không hề chạy */
+      ipUnavailable?: boolean;
+      /** Tầng 2: dừng chủ động trước ngưỡng 500 — còn việc, cursor đã giữ */
+      chainLimited?: boolean;
     }
 
     /**
      * P2 — Chạy 1 chain: 1 browser session, 1 target, ĐÚNG 1 kênh (cursor/engager/
      * group/post/friends). Nhờ tách kênh, nhiều account phục vụ cùng target song song.
      */
-    const runChain = async (accountId: number, task: ClaimedTask, pass: number): Promise<AccountChainOutcome> => {
+    const runChain = async (accountId: number, task: ClaimedTask, pass: number, warmup = false): Promise<AccountChainOutcome> => {
       const targetIdx = task.targetIdx;
       const currentTarget = parseFacebookTarget(targetList[targetIdx]);
       const chainStartedAt = Date.now();
       const out: AccountChainOutcome = { leads: 0, requests: 0, http500: 0, first500AtRequest: 0, durationMs: 0, dead: false, throttled: false, finished: false };
-      const spareProxy = pass >= 2 ? pickSpareProxy(accountId) : undefined;
+
+      // TẦNG 1 — giành IP TRƯỚC khi mở browser. Không có IP rảnh → nhường slot;
+      // tuyệt đối không chạy chung IP với session khác.
+      const sessionLease = chooseIpForSession({
+        registry: ipRegistry,
+        accountId,
+        accountProxy: accountProxyById.get(accountId) ?? null,
+        spareProxies,
+        allowSpare: pass >= 2,
+      });
+      if (!sessionLease) {
+        console.log(`[FB Scraper] ⏸️ Account #${accountId}: mọi IP khả dụng đang bận — nhường slot, thử lại sau.`);
+        out.ipUnavailable = true;
+        return out;
+      }
+      const spareProxy = sessionLease.proxy;
+
       let browserContext: BrowserContext | null = null;
       let sessionRequestsUsed = 0;
       let sessionHttp500 = 0;
@@ -2799,14 +2973,22 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           const detachInterceptor = attachFacebookGraphQLInterceptor(page, saveLeadBatch);
           const closePage = async () => { detachInterceptor(); await page.close().catch(() => {}); };
 
-          const sessionQuota = Math.min(maxPerAccountQuota, Math.max(50, maxLimit - scrapedCount));
+          // Tầng 2 — account đang warm-up chỉ nhận quota nhỏ để hạ "độ nóng" của phiên.
+          const effectiveQuota = warmup
+            ? Math.max(30, Math.round(maxPerAccountQuota * WARMUP_QUOTA_MULTIPLIER))
+            : maxPerAccountQuota;
+          const sessionQuota = Math.min(effectiveQuota, Math.max(30, maxLimit - scrapedCount));
+          if (warmup) console.log(`[FB Scraper] 🌱 Account #${accountId} đang warm-up — quota phiên hạ còn ${sessionQuota}.`);
           const sessionRequestBudget = {
             remaining: 1500,
+            // TẦNG 2 — Đếm quota ngày THẬT (mỗi request +1).
+            // Lỗi cũ: chỉ cộng khi `sessionRequestsUsed % 10 === 0`. Đo trên máy thật,
+            // chain trung bình chỉ 5-7 request → KHÔNG BAO GIỜ đạt mốc 10 → counter luôn 0
+            // dù telemetry có tới 216 request (account #3). Hệ quả: trần quota ngày
+            // chưa từng hoạt động, account không được nghỉ theo ngày.
             onSpend: () => {
               sessionRequestsUsed++;
-              if (sessionRequestsUsed % 10 === 0) {
-                db.prepare(`UPDATE social_accounts SET daily_request_count = COALESCE(daily_request_count, 0) + 10 WHERE id = ?`).run(accountId);
-              }
+              db.prepare(`UPDATE social_accounts SET daily_request_count = COALESCE(daily_request_count, 0) + 1 WHERE id = ?`).run(accountId);
             },
           };
 
@@ -2815,8 +2997,12 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
           await dismissFacebookDialogs(page);
 
           const pageHtml = await page.content().catch(() => '');
-          if (detectFacebookCheckpoint(page.url(), pageHtml)) {
-            console.warn(`[FB Scraper] ⚠️ Account #${accountId} hit Checkpoint — loại khỏi job.`);
+          const block = assessBlock(page.url(), pageHtml);
+
+          // ── CHECKPOINT (nặng): tài khoản thực sự bị khoá/xác minh danh tính ──
+          // Cooldown dài + cooldown proxy (IP đó đã bị FB gắn cờ cùng tài khoản).
+          if (block.kind === 'checkpoint') {
+            console.warn(`[FB Scraper] 🛑 Account #${accountId} CHECKPOINT thật (${block.markers.join(',')}) — cooldown dài.`);
             const proxyIdRow = db.prepare(`SELECT proxy_id FROM social_accounts WHERE id = ?`).get(accountId) as { proxy_id: number | null } | undefined;
             if (proxyIdRow?.proxy_id) {
               db.prepare(`UPDATE proxies SET status = 'cooldown' WHERE id = ?`).run(proxyIdRow.proxy_id);
@@ -2826,7 +3012,7 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
               db.prepare(`INSERT INTO crawler_logs (workspace_id, target_value, action_type, message) VALUES (?, ?, 'checkpoint', ?)`).run(
                 workspaceId,
                 `account:${accountId}`,
-                `Checkpoint nghiêm trọng — account cooldown 60', proxy ${proxyIdRow?.proxy_id || 'n/a'} cooldown cùng lúc.`
+                `Checkpoint thật (${block.markers.join(',')}) — account cooldown 60', proxy ${proxyIdRow?.proxy_id || 'n/a'} cooldown cùng lúc.`
               );
             } catch {}
             sendDesktopNotification(
@@ -2836,8 +3022,19 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
             pool.markExhausted(accountId);
             out.dead = true;
             await closePage();
-            return out;
           }
+
+          // ── LOGIN WALL (nhẹ): phiên/cookie hỏng, KHÔNG phải tài khoản bị khoá ──
+          // KHÔNG được cooldown account, KHÔNG được markExhausted: đo trên máy thật,
+          // account #4 từng bị đánh oan "checkpoint" và bị loại khỏi job, ngay sau đó
+          // job vẫn thu 373 leads và account vẫn khoẻ. Chỉ ngắt phiên này, nhường IP.
+          if (block.kind === 'login') {
+            console.warn(`[FB Scraper] 🔐 Account #${accountId} gặp login wall (${block.markers.join(',')}) — kết thúc phiên, KHÔNG cooldown account.`);
+            logBlockReasonOnce(`login:${accountId}`, `account:${accountId}`, 'login_wall',
+              `Account @${accountUsername} gặp login wall (${block.markers.join(',')}) — nghi cookie hết hạn. Phiên dừng, account KHÔNG bị cooldown.`);
+            out.finished = true;
+            await closePage();
+          } else {
 
           let capability = capabilityCache[targetIdx];
           if (!capability) {
@@ -2989,6 +3186,8 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
                     out.leads += result.newLeads;
                     sessionHttp500 += result.http500;
                     if (result.ended === 'throttled') out.throttled = true;
+                    // Tầng 2: dừng chủ động = còn việc, KHÔNG phải bị chặn
+                    if (result.ended === 'chain-limit') out.chainLimited = true;
                     if (result.first500AtRequest > 0 && out.first500AtRequest === 0) out.first500AtRequest = result.first500AtRequest;
                     if (result.nextCursor) setCursorForTarget(targetIdx, result.nextCursor);
                     else cursorsByTarget[targetIdx] = null;
@@ -3018,7 +3217,8 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
                   // (loop thoát vì đủ maxLeads cũng là 'done'). Chỉ đóng kênh khi còn quota
                   // mà danh sách đã hết; chạm quota thì giữ cursor cho chain kế tiếp.
                   const hitQuota = remaining() <= 0;
-                  if (!hitQuota && !out.throttled && !cancelSignal.cancelled) {
+                  // chain-limit KHÔNG đóng kênh: cursor còn giá trị, chain sau resume tiếp.
+                  if (!hitQuota && !out.throttled && !out.chainLimited && !cancelSignal.cancelled) {
                     cursorsByTarget[targetIdx] = null;
                     out.finished = true;
                   }
@@ -3069,7 +3269,8 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
             }
           }
 
-          await closePage();
+            await closePage();
+          }
         }
       } catch (sessionErr: unknown) {
         const sessionMsg = sessionErr instanceof Error ? sessionErr.message : String(sessionErr);
@@ -3087,7 +3288,16 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
         } catch (telErr: unknown) {
           console.warn(`[FB Scraper] Telemetry insert lỗi:`, telErr instanceof Error ? telErr.message : telErr);
         }
-        if (spareProxy) leasedProxyIds.delete(spareProxy.proxyId);
+        // Tầng 2 — đếm phiên THÀNH CÔNG (có lead, không bị chặn) để mở khoá warm-up.
+        // Chỉ tính khi account thực sự thu được lead, tránh "warm-up" bằng phiên rỗng.
+        if (!out.dead && !out.throttled && out.leads > 0) {
+          try {
+            db.prepare(`UPDATE social_accounts SET warmup_sessions = COALESCE(warmup_sessions, 0) + 1 WHERE id = ?`).run(accountId);
+          } catch { /* không chặn job vì lỗi đếm */ }
+        }
+
+        // Giải phóng IP trong finally — kể cả khi session lỗi, IP phải trả lại pool.
+        ipRegistry.release(sessionLease.ipKey);
         if (browserContext) {
           try { await browserContext.close(); } catch {}
         }
@@ -3104,6 +3314,8 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
      */
     const runAccountWorker = async (accountId: number): Promise<void> => {
       let pass = 1;
+      // Tầng 2 — trạng thái warm-up chỉ đọc lại khi cần (sau mỗi chain có lead).
+      let warmupSessions = (db.prepare(`SELECT COALESCE(warmup_sessions,0) AS n FROM social_accounts WHERE id = ?`).get(accountId) as { n: number } | undefined)?.n ?? 0;
       while (!cancelSignal.cancelled && scrapedCount < maxLimit && !pool.get(accountId)!.exhausted) {
         const waitMs = pool.cooldownRemaining(accountId, Date.now());
         if (waitMs > 0) {
@@ -3122,12 +3334,23 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
 
         let outcome: AccountChainOutcome | null = null;
         try {
-          console.log(`[FB Scraper] 🔄 Account #${accountId} chain ${pass} → target [${task.targetIdx + 1}/${targetList.length}] kênh [${task.channel}].`);
-          outcome = await runChain(accountId, task, pass);
+          const isWarmup = warmupSessions < WARMUP_SESSIONS_REQUIRED;
+          console.log(`[FB Scraper] 🔄 Account #${accountId} chain ${pass} → target [${task.targetIdx + 1}/${targetList.length}] kênh [${task.channel}]${isWarmup ? ` (warm-up ${warmupSessions}/${WARMUP_SESSIONS_REQUIRED})` : ''}.`);
+          outcome = await runChain(accountId, task, pass, isWarmup);
+          // Cập nhật lại bộ đếm sau chain (runChain đã tăng khi thu được lead)
+          if (outcome.leads > 0 && !outcome.dead) warmupSessions++;
           if (outcome.finished) board.markFinished(task.targetIdx, task.channel);
         } finally {
           board.release(task, accountId);
           releaseSlot();
+        }
+
+        // TẦNG 1 — không giành được IP: KHÔNG phải lỗi của account. Nhường slot, thử
+        // lại sau vài giây, và tuyệt đối không tính vào chuỗi 0-lead (tránh loại oan
+        // account chỉ vì IP đang bận do account khác dùng chung).
+        if (outcome?.ipUnavailable) {
+          await sleep(3000 + Math.floor(Math.random() * 4000));
+          continue;
         }
 
         const chainLeads = outcome?.leads ?? 0;
@@ -3146,13 +3369,19 @@ export async function runFacebookScrapeJob(options: ScrapeJobOptions): Promise<v
         // P5 — cooldown nền lấy từ telemetry (nếu có), đè bởi luật cứng khi chain
         // rỗng/quota cạn; throttle luôn dùng cooldown ngắn để nhường slot.
         const tunedCooldown = pacingByAccount.get(accountId)?.cooldownMs;
-        const cooldownMs = outcome?.throttled
-          ? 2 * 60_000
-          : chainLeads === 0
-            ? 5 * 60_000
-            : chainLeads >= maxPerAccountQuota
-              ? (tunedCooldown ?? 10 * 60_000)
-              : 60_000;
+        // Tầng 2 — chain dừng chủ động vì chạm trần chuỗi: account vẫn khoẻ, chỉ cần
+        // nhường slot cho session khác rồi quay lại với IP/chuỗi mới. Nghỉ ngắn.
+        const cooldownMs = outcome?.chainLimited
+          ? 20_000
+          : warmupSessions < WARMUP_SESSIONS_REQUIRED
+            ? 15 * 60_000 // warm-up: nghỉ dài để hạ độ nóng của account mới
+            : outcome?.throttled
+              ? 2 * 60_000
+              : chainLeads === 0
+                ? 5 * 60_000
+                : chainLeads >= maxPerAccountQuota
+                  ? (tunedCooldown ?? 10 * 60_000)
+                  : 60_000;
         pool.noteChainDone(accountId, { now: Date.now(), cooldownMs, unproductive: chainLeads === 0, maxUnproductive: 2 });
         pass++;
         console.log(`[FB Scraper] ⏳ Account #${accountId} chain [${task.channel}] xong (+${chainLeads} leads) — nghỉ ${Math.round(cooldownMs / 1000)}s.`);
